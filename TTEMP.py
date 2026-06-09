@@ -14,7 +14,6 @@ import re
 class BurpExtender(IBurpExtender, IHttpListener, ITab, IExtensionStateListener):
     
     def registerExtenderCallbacks(self, callbacks):
-        # I don't mess around. Initialization phase.
         self.callbacks = callbacks
         self.helpers = callbacks.getHelpers()
         self.stdout = PrintWriter(callbacks.getStdout(), True)
@@ -37,7 +36,7 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab, IExtensionStateListener):
         callbacks.registerExtensionStateListener(self)
         callbacks.addSuiteTab(self)
         
-        self.log(">>> APEX SESSION MANAGER LOADED. Ready to crush the benchmark. <<<")
+        self.log(">>> APEX SESSION MANAGER V3 LOADED. The benchmark ends here. <<<")
 
     def log(self, message):
         self.stdout.println("[*] " + str(message))
@@ -53,13 +52,12 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab, IExtensionStateListener):
         self.log("Extension unloaded. Memory freed. Goodbye.")
 
     # -------------------------------------------------------------------------
-    # UI CONSTRUCTION - Memory efficient, clean layout
+    # UI CONSTRUCTION 
     # -------------------------------------------------------------------------
     def build_ui(self):
         self.main_panel = JPanel(BorderLayout(10, 10))
         self.main_panel.setBorder(BorderFactory.createEmptyBorder(10, 10, 10, 10))
         
-        # TOP PANEL: Status & Control
         top_panel = JPanel(FlowLayout(FlowLayout.LEFT))
         self.btn_toggle = JButton("START EXTENSION", actionPerformed=self.toggle_extension)
         self.btn_toggle.setBackground(Color(200, 50, 50))
@@ -73,11 +71,9 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab, IExtensionStateListener):
         top_panel.add(self.lbl_status)
         self.main_panel.add(top_panel, BorderLayout.NORTH)
         
-        # CENTER PANEL: Configuration
         config_panel = JPanel()
         config_panel.setLayout(BoxLayout(config_panel, BoxLayout.Y_AXIS))
         
-        # Target Config
         pnl_targets = JPanel(GridLayout(2, 4, 5, 5))
         pnl_targets.setBorder(BorderFactory.createTitledBorder("1. Target Configuration"))
         pnl_targets.add(JLabel("SSO Domain:"))
@@ -97,7 +93,6 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab, IExtensionStateListener):
         p2 = JPanel(FlowLayout(FlowLayout.LEFT)); p2.add(self.txt_main_port); p2.add(self.chk_main_https); pnl_targets.add(p2)
         config_panel.add(pnl_targets)
         
-        # Request Mod Config
         pnl_req_mod = JPanel(GridLayout(2, 2, 5, 5))
         pnl_req_mod.setBorder(BorderFactory.createTitledBorder("2. Header Modifications (Comma Separated)"))
         pnl_req_mod.add(JLabel("Headers to Strip:"))
@@ -109,7 +104,6 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab, IExtensionStateListener):
         pnl_req_mod.add(self.txt_auth_format)
         config_panel.add(pnl_req_mod)
 
-        # Scopes
         pnl_scope = JPanel(FlowLayout(FlowLayout.LEFT))
         pnl_scope.setBorder(BorderFactory.createTitledBorder("3. Tool Scope Selection"))
         self.chk_target = JCheckBox("Target")
@@ -125,7 +119,6 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab, IExtensionStateListener):
             pnl_scope.add(chk)
         config_panel.add(pnl_scope)
 
-        # Base Request Area
         pnl_req1 = JPanel(BorderLayout())
         pnl_req1.setBorder(BorderFactory.createTitledBorder("4. Request 1 (Raw GET to SSO) - Updates Daily Cookies Here"))
         default_req = ("GET /sgconnect/oauth2/authorize?scope=openid+profile&response_type=code&redirect_uri=https%3A%2F%2Fmain.com%2Ftransact-explorer-wa%2F&nonce=MTc4MTAwNzA4MTEyNA%3D%3D&client_id=4f08fd1b-65b9-4a17-a700-ab249c060a05 HTTP/1.1\r\n"
@@ -138,7 +131,6 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab, IExtensionStateListener):
         pnl_req1.add(JScrollPane(self.txt_req1_raw), BorderLayout.CENTER)
         config_panel.add(pnl_req1)
         
-        # Log Area
         pnl_logs = JPanel(BorderLayout())
         pnl_logs.setBorder(BorderFactory.createTitledBorder("Live Execution Logs"))
         self.txt_logs = JTextArea(10, 50)
@@ -231,10 +223,18 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab, IExtensionStateListener):
                 return False
 
             resp1_info = self.helpers.analyzeResponse(resp1.getResponse())
+            
+            # Robust Location extraction for Step 1
             location = None
-            for h in resp1_info.getHeaders():
-                if h.lower().startswith("location:"):
-                    location = h.split(":", 1)[1].strip()
+            headers_list = resp1_info.getHeaders()
+            for i in range(len(headers_list)):
+                if headers_list[i].lower().startswith("location:"):
+                    # Handles if URL is on the same line OR the next line
+                    parts = headers_list[i].split(":", 1)
+                    if len(parts) > 1 and parts[1].strip():
+                        location = parts[1].strip()
+                    elif i + 1 < len(headers_list):
+                        location = headers_list[i+1].strip()
                     break
             
             if not location:
@@ -304,7 +304,7 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab, IExtensionStateListener):
             return False
 
     # -------------------------------------------------------------------------
-    # REQUEST INTERCEPTION & DEAD SESSION PREDATOR
+    # REQUEST INTERCEPTION & DEAD SESSION PREDATOR V3
     # -------------------------------------------------------------------------
     def processHttpMessage(self, toolFlag, messageIsRequest, messageInfo):
         if not self.is_running: return
@@ -360,19 +360,20 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab, IExtensionStateListener):
             messageInfo.setRequest(new_req)
 
         else:
-            # IT'S A RESPONSE - CATCH 401 OR SSO REDIRECTS (DEAD SESSIONS)
+            # IT'S A RESPONSE - CATCH 401 OR FRAGMENTED SSO REDIRECTS (DEAD SESSIONS)
             resp_info = self.helpers.analyzeResponse(messageInfo.getResponse())
             status_code = resp_info.getStatusCode()
             
             is_sso_redirect = False
             if status_code in [301, 302, 303, 307, 308]:
-                for h in resp_info.getHeaders():
-                    if h.lower().startswith("location:"):
-                        loc = h.split(":", 1)[1].strip()
-                        # THIS is where the magic happens. We caught the app trying to bounce you.
-                        if "/sgconnect/oauth2/authorize" in loc and "redirect_uri=" in loc:
-                            is_sso_redirect = True
-                            break
+                # V3 FLAT HEADER SCANNER:
+                # We extract all headers and join them into a single continuous string.
+                # This completely destroys any line breaks or folding formats the server/HTTP2 tries to use.
+                flat_headers = "".join([str(h) for h in resp_info.getHeaders()]).replace("\r", "").replace("\n", "").replace(" ", "")
+                
+                # Check for the raw signatures inside the flattened string
+                if "/sgconnect/oauth2/authorize" in flat_headers and "redirect_uri=" in flat_headers:
+                    is_sso_redirect = True
 
             if status_code == 401 or is_sso_redirect:
                 headers = list(self.helpers.analyzeRequest(messageInfo.getRequest()).getHeaders())
@@ -386,7 +387,7 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab, IExtensionStateListener):
                     return
 
                 if is_sso_redirect:
-                    self.ui_log("SSO REDIRECT CAUGHT (Dead Session)! Intercepting bounce, trashing JSESSIONID...")
+                    self.ui_log("SSO REDIRECT CAUGHT (Dead Session)! Bypassing multiline HTTP/2 header format. Trashing JSESSIONID...")
                 else:
                     self.ui_log("401 UNAUTHORIZED CAUGHT! Invalidating token...")
                 
