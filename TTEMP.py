@@ -1,382 +1,427 @@
 # -*- coding: utf-8 -*-
-from burp import IBurpExtender, IHttpListener, ITab
+from burp import IBurpExtender, IHttpListener, ITab, IExtensionStateListener
 from java.io import PrintWriter
-from javax.swing import JPanel, JCheckBox, BoxLayout, JLabel, BorderFactory
-from java.awt import Component
+from javax.swing import (JPanel, JCheckBox, JLabel, JTextField, JTextArea, JButton, JScrollPane, 
+                         SwingUtilities, BoxLayout, BorderFactory, JSplitPane)
+from java.awt import BorderLayout, GridLayout, FlowLayout, Color, Font
+from java.net import URL
 import threading
 import json
+import base64
+import time
 import re
 
-class BurpExtender(IBurpExtender, IHttpListener, ITab):
-
+class BurpExtender(IBurpExtender, IHttpListener, ITab, IExtensionStateListener):
+    
     def registerExtenderCallbacks(self, callbacks):
-        self._callbacks = callbacks
-        self._helpers   = callbacks.getHelpers()
-        self._stdout    = PrintWriter(callbacks.getStdout(), True)
-        self._stderr    = PrintWriter(callbacks.getStderr(), True)
-
-        # =====================================================
-        # CONFIGURE THESE VALUES ONLY
-        # =====================================================
-        self.sso_url = "https://sso.com/sgconnect/oauth2/authorize?scope=openid%20profile&response_type=code&redirect_uri=https://host.com/explorer-wa/&nonce=MTc4MDk4MTM1MTY50A%3D%3D&client_id=XXXXXXXXXXXXXXXX"
-        self.sso_cookies = "SGX_tid=XXXXXXXXXXXXXXXXXXXXXXXX; sgx-11=XXXXXXXXXXXXXXXX; OAUTH_REQUEST_ATTRIBUTES=XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX; SGX_PRD_authN_sticky_id=XXXXXXXXXXXXXXXXXXXXXXXXXXXXXX; amlbcookie=01; 12=XXXXXXXXXXXX"
-        self.token_url = "https://host.com/explore-wa/token"
-        # =====================================================
-
-        # Thread Safety & Memory Storage
-        self._jsessionid = None
-        self._jwt_token  = None
-        self.refresh_lock = threading.Lock()
-
-        callbacks.setExtensionName("SSO God-Mode Auto Refresher")
+        # I don't mess around. Initialization phase.
+        self.callbacks = callbacks
+        self.helpers = callbacks.getHelpers()
+        self.stdout = PrintWriter(callbacks.getStdout(), True)
+        self.stderr = PrintWriter(callbacks.getStderr(), True)
         
-        # Build the UI Panel
-        self._build_ui()
-        callbacks.addSuiteTab(self)
+        callbacks.setExtensionName("Apex Session Manager (Angry Edition)")
+        
+        # Core State Variables (Thread-Safe)
+        self.lock = threading.RLock()
+        self.is_running = False
+        self.jwt_token = None
+        self.jsessionid = None
+        self.token_exp = 0
+        
+        # Build the UI
+        self.build_ui()
+        
+        # Register listeners
         callbacks.registerHttpListener(self)
+        callbacks.registerExtensionStateListener(self)
+        callbacks.addSuiteTab(self)
+        
+        self.log(">>> APEX SESSION MANAGER LOADED. Ready to crush the benchmark. <<<")
 
-        self._stdout.println("[+] SSO Refresher Loaded.")
-        self._stdout.println("[+] OStoken will be brutally executed on sight.")
-        self._stdout.println("[+] Proactive injection enabled. 401s will be intercepted and crushed.")
+    def log(self, message):
+        # Console output for the weak who need to see what's happening
+        self.stdout.println("[*] " + str(message))
 
-    # ----------------------------------------------------------
-    # UI IMPLEMENTATION (LIGHTWEIGHT SWING)
-    # ----------------------------------------------------------
     def getTabCaption(self):
-        return "SSO God-Mode"
+        return "Apex Session"
 
     def getUiComponent(self):
-        return self.ui_panel
+        return self.main_panel
+        
+    def extensionUnloaded(self):
+        self.is_running = False
+        self.log("Extension unloaded. Memory freed. Goodbye.")
 
-    def _build_ui(self):
-        self.ui_panel = JPanel()
-        self.ui_panel.setLayout(BoxLayout(self.ui_panel, BoxLayout.Y_AXIS))
-        self.ui_panel.setBorder(BorderFactory.createEmptyBorder(15, 15, 15, 15))
+    # -------------------------------------------------------------------------
+    # UI CONSTRUCTION - Memory efficient, clean layout
+    # -------------------------------------------------------------------------
+    def build_ui(self):
+        self.main_panel = JPanel(BorderLayout(10, 10))
+        self.main_panel.setBorder(BorderFactory.createEmptyBorder(10, 10, 10, 10))
+        
+        # TOP PANEL: Status & Control
+        top_panel = JPanel(FlowLayout(FlowLayout.LEFT))
+        self.btn_toggle = JButton("START EXTENSION", actionPerformed=self.toggle_extension)
+        self.btn_toggle.setBackground(Color(200, 50, 50))
+        self.btn_toggle.setForeground(Color.WHITE)
+        self.btn_toggle.setFont(Font("Arial", Font.BOLD, 14))
+        
+        self.lbl_status = JLabel(" Status: STOPPED | Token: NULL")
+        self.lbl_status.setFont(Font("Arial", Font.BOLD, 12))
+        
+        top_panel.add(self.btn_toggle)
+        top_panel.add(self.lbl_status)
+        self.main_panel.add(top_panel, BorderLayout.NORTH)
+        
+        # CENTER PANEL: Configuration
+        config_panel = JPanel()
+        config_panel.setLayout(BoxLayout(config_panel, BoxLayout.Y_AXIS))
+        
+        # Target Config
+        pnl_targets = JPanel(GridLayout(2, 4, 5, 5))
+        pnl_targets.setBorder(BorderFactory.createTitledBorder("1. Target Configuration"))
+        pnl_targets.add(JLabel("SSO Domain:"))
+        self.txt_sso_host = JTextField("sso.com")
+        pnl_targets.add(self.txt_sso_host)
+        pnl_targets.add(JLabel("SSO Port/HTTPS:"))
+        self.txt_sso_port = JTextField("443")
+        self.chk_sso_https = JCheckBox("HTTPS", True)
+        p1 = JPanel(FlowLayout(FlowLayout.LEFT)); p1.add(self.txt_sso_port); p1.add(self.chk_sso_https); pnl_targets.add(p1)
+        
+        pnl_targets.add(JLabel("Main Domain:"))
+        self.txt_main_host = JTextField("main.com")
+        pnl_targets.add(self.txt_main_host)
+        pnl_targets.add(JLabel("Main Port/HTTPS:"))
+        self.txt_main_port = JTextField("443")
+        self.chk_main_https = JCheckBox("HTTPS", True)
+        p2 = JPanel(FlowLayout(FlowLayout.LEFT)); p2.add(self.txt_main_port); p2.add(self.chk_main_https); pnl_targets.add(p2)
+        config_panel.add(pnl_targets)
+        
+        # Request Mod Config
+        pnl_req_mod = JPanel(GridLayout(2, 2, 5, 5))
+        pnl_req_mod.setBorder(BorderFactory.createTitledBorder("2. Header Modifications (Comma Separated)"))
+        pnl_req_mod.add(JLabel("Headers to Strip (e.g. sec-ch-ua):"))
+        self.txt_strip_headers = JTextField("sec-ch-ua, sec-ch-ua-mobile, sec-ch-ua-platform, Sec-Fetch-Site, Sec-Fetch-Mode, Sec-Fetch-Dest")
+        pnl_req_mod.add(self.txt_strip_headers)
+        
+        pnl_req_mod.add(JLabel("Auth Header Format:"))
+        self.txt_auth_format = JTextField("Bearer {}")
+        pnl_req_mod.add(self.txt_auth_format)
+        config_panel.add(pnl_req_mod)
 
-        lbl = JLabel("<html><h3>Select Burp Tools to apply Token Injection & Auto-Refresh:</h3></html>")
-        lbl.setAlignmentX(Component.LEFT_ALIGNMENT)
-        self.ui_panel.add(lbl)
+        # Scopes
+        pnl_scope = JPanel(FlowLayout(FlowLayout.LEFT))
+        pnl_scope.setBorder(BorderFactory.createTitledBorder("3. Tool Scope Selection"))
+        self.chk_target = JCheckBox("Target")
+        self.chk_intruder = JCheckBox("Intruder", True)
+        self.chk_scanner = JCheckBox("Scanner")
+        self.chk_repeater = JCheckBox("Repeater", True)
+        self.chk_extensions = JCheckBox("Extensions")
+        self.chk_sequencer = JCheckBox("Sequencer")
+        self.chk_proxy = JCheckBox("Proxy (Use with caution)")
+        
+        for chk in [self.chk_target, self.chk_intruder, self.chk_scanner, self.chk_repeater, 
+                    self.chk_extensions, self.chk_sequencer, self.chk_proxy]:
+            pnl_scope.add(chk)
+        config_panel.add(pnl_scope)
 
-        self.tool_boxes = {}
-        # Mapping UI names to Burp Tool Flags. Burp AI usually uses Extender/Scanner flags.
-        tools = [
-            ("Target", self._callbacks.TOOL_TARGET, True),
-            ("Intruder", self._callbacks.TOOL_INTRUDER, True),
-            ("Extensions", self._callbacks.TOOL_EXTENDER, True),
-            ("Scanner", self._callbacks.TOOL_SCANNER, True),
-            ("Sequencer", self._callbacks.TOOL_SEQUENCER, True),
-            ("Proxy (use with caution)", self._callbacks.TOOL_PROXY, False),
-            ("Repeater", self._callbacks.TOOL_REPEATER, True),
-            ("Burp AI", self._callbacks.TOOL_EXTENDER, True) 
-        ]
+        # Base Request Area
+        pnl_req1 = JPanel(BorderLayout())
+        pnl_req1.setBorder(BorderFactory.createTitledBorder("4. Request 1 (Raw GET to SSO) - Updates Daily Cookies Here"))
+        default_req = ("GET /sgconnect/oauth2/authorize?scope=openid+profile&response_type=code&redirect_uri=https%3A%2F%2Fmain.com%2Ftransact-explorer-wa%2F&nonce=MTc4MTAwNzA4MTEyNA%3D%3D&client_id=4f08fd1b-65b9-4a17-a700-ab249c060a05 HTTP/1.1\r\n"
+                       "Host: sso.com\r\n"
+                       "Connection: keep-alive\r\n"
+                       "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64)\r\n"
+                       "Cookie: SGX_tid=13c4f8114520a476220931ab1f7673d3; amlbcookie=01; sgx-l1=YOUR_COOKIE_HERE\r\n\r\n")
+        self.txt_req1_raw = JTextArea(default_req, 10, 50)
+        self.txt_req1_raw.setFont(Font("Monospaced", Font.PLAIN, 12))
+        pnl_req1.add(JScrollPane(self.txt_req1_raw), BorderLayout.CENTER)
+        config_panel.add(pnl_req1)
+        
+        # Log Area
+        pnl_logs = JPanel(BorderLayout())
+        pnl_logs.setBorder(BorderFactory.createTitledBorder("Live Execution Logs"))
+        self.txt_logs = JTextArea(10, 50)
+        self.txt_logs.setFont(Font("Monospaced", Font.PLAIN, 12))
+        self.txt_logs.setEditable(False)
+        pnl_logs.add(JScrollPane(self.txt_logs), BorderLayout.CENTER)
 
-        for name, flag, default_state in tools:
-            chk = JCheckBox(name)
-            chk.setSelected(default_state)
-            chk.setAlignmentX(Component.LEFT_ALIGNMENT)
-            self.tool_boxes[name] = {'box': chk, 'flag': flag}
-            self.ui_panel.add(chk)
+        split_pane = JSplitPane(JSplitPane.VERTICAL_SPLIT, config_panel, pnl_logs)
+        split_pane.setResizeWeight(0.7)
+        self.main_panel.add(split_pane, BorderLayout.CENTER)
 
-    def _is_tool_enabled(self, toolFlag):
-        for name, data in self.tool_boxes.items():
-            if data['box'].isSelected() and data['flag'] == toolFlag:
-                return True
-            # Special bypass for Burp AI if running under an unrecognized flag
-            if name == "Burp AI" and data['box'].isSelected() and toolFlag not in [4,8,16,32,64,256]:
-                return True
+    def toggle_extension(self, event):
+        self.is_running = not self.is_running
+        if self.is_running:
+            self.btn_toggle.setText("STOP EXTENSION")
+            self.btn_toggle.setBackground(Color(50, 150, 50))
+            self.ui_log("Extension STARTED. Intercepting configured tools.")
+            # Trigger initial fetch asynchronously
+            threading.Thread(target=self.fetch_new_token).start()
+        else:
+            self.btn_toggle.setText("START EXTENSION")
+            self.btn_toggle.setBackground(Color(200, 50, 50))
+            self.ui_log("Extension STOPPED.")
+
+    def ui_log(self, msg):
+        self.log(msg)
+        def update():
+            self.txt_logs.append("[*] " + msg + "\n")
+            self.txt_logs.setCaretPosition(self.txt_logs.getDocument().getLength())
+            
+            # Update status label
+            status = "RUNNING" if self.is_running else "STOPPED"
+            exp_time = time.strftime('%H:%M:%S', time.localtime(self.token_exp)) if self.token_exp > 0 else "NULL"
+            self.lbl_status.setText(" Status: {} | Token Exp: {}".format(status, exp_time))
+        SwingUtilities.invokeLater(update)
+
+    def is_tool_enabled(self, toolFlag):
+        if toolFlag == self.callbacks.TOOL_TARGET and self.chk_target.isSelected(): return True
+        if toolFlag == self.callbacks.TOOL_INTRUDER and self.chk_intruder.isSelected(): return True
+        if toolFlag == self.callbacks.TOOL_SCANNER and self.chk_scanner.isSelected(): return True
+        if toolFlag == self.callbacks.TOOL_REPEATER and self.chk_repeater.isSelected(): return True
+        if toolFlag == self.callbacks.TOOL_EXTENDER and self.chk_extensions.isSelected(): return True
+        if toolFlag == self.callbacks.TOOL_SEQUENCER and self.chk_sequencer.isSelected(): return True
+        if toolFlag == self.callbacks.TOOL_PROXY and self.chk_proxy.isSelected(): return True
         return False
 
-    # ----------------------------------------------------------
-    # CORE HTTP PROCESSING
-    # ----------------------------------------------------------
-    def processHttpMessage(self, toolFlag, messageIsRequest, messageInfo):
-        if not self._is_tool_enabled(toolFlag):
-            return
-
+    # -------------------------------------------------------------------------
+    # CORE AUTHENTICATION LOGIC - The 3 Step OAuth Bypass
+    # -------------------------------------------------------------------------
+    def get_exp_from_jwt(self, token):
         try:
-            if messageIsRequest:
-                self._proactive_inject(messageInfo)
-            else:
-                self._reactive_refresh(messageInfo)
+            parts = token.split('.')
+            if len(parts) < 2: return 0
+            payload = parts[1]
+            payload += '=' * (-len(payload) % 4) # Fix padding for jython
+            decoded = base64.urlsafe_b64decode(payload.encode('ascii'))
+            data = json.loads(decoded.decode('utf-8'))
+            return float(data.get('exp', 0))
         except Exception as e:
-            self._stderr.println("[-] FATAL in processHttpMessage: " + str(e))
+            self.ui_log("JWT Decode Error (Your token is malformed!): " + str(e))
+            return 0
 
-    # ----------------------------------------------------------
-    # PROACTIVE INJECTION (NO MORE 401 ON FIRST REQUEST)
-    # ----------------------------------------------------------
-    def _proactive_inject(self, messageInfo):
-        request_bytes = messageInfo.getRequest()
-        if not request_bytes: return
+    def is_token_valid(self):
+        # 15 seconds buffer so we don't send an expiring token.
+        return self.jwt_token is not None and (self.token_exp - time.time()) > 15
 
-        req_info = self._helpers.analyzeRequest(request_bytes)
-        headers = list(req_info.getHeaders())
-        body_bytes = request_bytes[req_info.getBodyOffset():]
+    def make_call(self, host, port, is_https, req_bytes):
+        service = self.helpers.buildHttpService(host, int(port), is_https)
+        return self.callbacks.makeHttpRequest(service, req_bytes)
 
-        new_headers = []
-        auth_replaced = False
-        modified = False
+    def fetch_new_token(self):
+        # DOUBLE CHECKED LOCKING: The mark of a true optimized architecture.
+        if self.is_token_valid():
+            return True
 
-        # Keep the HTTP method line
-        new_headers.append(headers[0])
+        with self.lock:
+            # If 50 threads were waiting, 49 will see it's valid now and skip execution.
+            if self.is_token_valid():
+                return True
+                
+            self.ui_log("Initiating highly-optimized 3-step OAuth flow...")
+            
+            sso_host = self.txt_sso_host.getText().strip()
+            sso_port = self.txt_sso_port.getText().strip()
+            sso_https = self.chk_sso_https.isSelected()
+            main_host = self.txt_main_host.getText().strip()
+            main_port = self.txt_main_port.getText().strip()
+            main_https = self.chk_main_https.isSelected()
 
-        for hdr in headers[1:]:
-            lower_hdr = hdr.lower()
+            # --- STEP 1 ---
+            raw_req1 = self.txt_req1_raw.getText().replace('\r\n', '\n').replace('\n', '\r\n')
+            resp1 = self.make_call(sso_host, sso_port, sso_https, self.helpers.stringToBytes(raw_req1))
+            if not resp1 or not resp1.getResponse():
+                self.ui_log("ERROR: Step 1 failed. No response from SSO.")
+                return False
 
-            # NUKE OSTOKEN HEADER FROM EXISTENCE
-            if lower_hdr.startswith("ostoken:"):
-                modified = True
-                continue
+            resp1_info = self.helpers.analyzeResponse(resp1.getResponse())
+            location = None
+            for h in resp1_info.getHeaders():
+                if h.lower().startswith("location:"):
+                    location = h.split(":", 1)[1].strip()
+                    break
+            
+            if not location:
+                self.ui_log("ERROR: Step 1 failed. No Location header found. Cookie expired?")
+                return False
+                
+            self.ui_log("Step 1 Success. Extracted Location: " + location[:50] + "...")
 
-            # INJECT JWT
-            if lower_hdr.startswith("authorization:"):
-                if self._jwt_token:
-                    new_headers.append("Authorization: Bearer " + self._jwt_token)
-                    auth_replaced = True
-                    modified = True
+            # --- STEP 2 ---
+            try:
+                url = URL(location)
+                path_query = url.getFile()
+            except:
+                path_query = location
+
+            req2_str = "GET {} HTTP/1.1\r\nHost: {}\r\nConnection: close\r\n\r\n".format(path_query, main_host)
+            resp2 = self.make_call(main_host, main_port, main_https, self.helpers.stringToBytes(req2_str))
+            if not resp2 or not resp2.getResponse():
+                self.ui_log("ERROR: Step 2 failed. No response.")
+                return False
+                
+            resp2_info = self.helpers.analyzeResponse(resp2.getResponse())
+            jsessionid = None
+            for h in resp2_info.getHeaders():
+                if h.lower().startswith("set-cookie:"):
+                    c_val = h.split(":", 1)[1].strip()
+                    match = re.search(r"JSESSIONID=([^;]+)", c_val)
+                    if match:
+                        jsessionid = match.group(1)
+            
+            if not jsessionid:
+                self.ui_log("ERROR: Step 2 failed. No JSESSIONID set by server.")
+                return False
+
+            self.jsessionid = jsessionid
+            self.ui_log("Step 2 Success. Extracted JSESSIONID: " + self.jsessionid)
+
+            # --- STEP 3 ---
+            req3_str = ("GET /transact-explorer-wa/token HTTP/1.1\r\n"
+                        "Host: {}\r\n"
+                        "Cookie: JSESSIONID={}\r\n"
+                        "Accept: application/json\r\n"
+                        "Connection: close\r\n\r\n").format(main_host, self.jsessionid)
+            resp3 = self.make_call(main_host, main_port, main_https, self.helpers.stringToBytes(req3_str))
+            
+            if not resp3 or not resp3.getResponse():
+                self.ui_log("ERROR: Step 3 failed. No response.")
+                return False
+                
+            resp3_info = self.helpers.analyzeResponse(resp3.getResponse())
+            body_bytes = resp3.getResponse()[resp3_info.getBodyOffset():]
+            body_str = self.helpers.bytesToString(body_bytes)
+            
+            try:
+                data = json.loads(body_str)
+                token = data.get("token")
+                if token:
+                    self.jwt_token = token
+                    self.token_exp = self.get_exp_from_jwt(token)
+                    self.ui_log("Step 3 Success! JWT Token extracted and cached. Expires: " + str(self.token_exp))
+                    return True
                 else:
-                    new_headers.append(hdr)
-                continue
+                    self.ui_log("ERROR: Step 3 failed. JSON did not contain 'token' key. Body: " + body_str[:100])
+            except Exception as e:
+                self.ui_log("ERROR: Step 3 failed. JSON parse error: " + str(e))
+            
+            return False
 
-            # INJECT JSESSIONID
-            if lower_hdr.startswith("cookie:"):
-                if self._jsessionid:
-                    if "jsessionid=" in lower_hdr:
-                        # Fast Regex to replace existing JSESSIONID without breaking other cookies
-                        hdr = re.sub(r'(?i)(JSESSIONID=)[^;\s]+', r'\g<1>' + self._jsessionid, hdr)
-                    else:
-                        hdr = hdr + "; JSESSIONID=" + self._jsessionid
-                    modified = True
-                new_headers.append(hdr)
-                continue
+    # -------------------------------------------------------------------------
+    # REQUEST INTERCEPTION - Stripping headers, injecting Tokens flawlessly
+    # -------------------------------------------------------------------------
+    def processHttpMessage(self, toolFlag, messageIsRequest, messageInfo):
+        if not self.is_running: return
+        if not self.is_tool_enabled(toolFlag): return
 
-            new_headers.append(hdr)
-
-        # ADD AUTHORIZATION IF MISSING ENTIRELY
-        if not auth_replaced and self._jwt_token:
-            new_headers.append("Authorization: Bearer " + self._jwt_token)
-            modified = True
-
-        if modified:
-            new_request = self._helpers.buildHttpMessage(new_headers, body_bytes)
-            messageInfo.setRequest(new_request)
-
-    # ----------------------------------------------------------
-    # REACTIVE REFRESH (INTERCEPTS 401s AND FIXES THEM INVISIBLY)
-    # ----------------------------------------------------------
-    def _reactive_refresh(self, messageInfo):
-        response_bytes = messageInfo.getResponse()
-        if not response_bytes: return
-
-        resp_info = self._helpers.analyzeResponse(response_bytes)
-        status = resp_info.getStatusCode()
+        req_info = self.helpers.analyzeRequest(messageInfo)
+        file_path = req_info.getUrl().getFile()
         
-        # Don't waste CPU parsing body if it's not a 401 or close to it
-        if status not in [401, 403]:
+        # PREVENT INFINITE RECURSION - Do not touch the OAuth endpoints!
+        if ("/sgconnect/oauth2/authorize" in file_path or 
+            "/transact-explorer-wa/token" in file_path or 
+            ("code=" in file_path and "session_state=" in file_path)):
             return
 
-        body_offset = resp_info.getBodyOffset()
-        resp_body = self._helpers.bytesToString(response_bytes[body_offset:])
+        if messageIsRequest:
+            # 1. Evaluate Token Status First (Fetch blocks if needed)
+            if not self.is_token_valid():
+                if not self.fetch_new_token():
+                    self.log("Bypassing modification. Could not fetch token.")
+                    return
+            
+            # 2. Modify Headers
+            headers = list(req_info.getHeaders())
+            strip_list = [h.strip().lower() for h in self.txt_strip_headers.getText().split(",") if h.strip()]
+            
+            new_headers = []
+            cookie_found = False
+            
+            for h in headers:
+                name = h.split(":")[0].lower().strip()
+                
+                # Strip user defined headers
+                if name in strip_list:
+                    continue
+                # Strip existing Authorization so we can overwrite
+                if name == "authorization":
+                    continue
+                    
+                # Handle JSESSIONID overwrite for main domain
+                if name == "cookie" and self.jsessionid:
+                    cookie_found = True
+                    c_val = h.split(":", 1)[1].strip()
+                    if "JSESSIONID=" in c_val:
+                        c_val = re.sub(r"JSESSIONID=[^;]+", "JSESSIONID=" + self.jsessionid, c_val)
+                    else:
+                        c_val += "; JSESSIONID=" + self.jsessionid
+                    new_headers.append("Cookie: " + c_val)
+                    continue
 
-        if "Jwt token Expired!" not in resp_body and status != 401:
-            return
+                new_headers.append(h)
+                
+            # Add JWT Token
+            auth_format = self.txt_auth_format.getText()
+            new_headers.append("Authorization: " + auth_format.format(self.jwt_token))
+            
+            # Add JSESSIONID if no cookie header existed and we have one
+            if not cookie_found and self.jsessionid and self.txt_main_host.getText().strip() in req_info.getUrl().getHost():
+                new_headers.append("Cookie: JSESSIONID=" + self.jsessionid)
+                
+            # Rebuild and set
+            body_bytes = messageInfo.getRequest()[req_info.getBodyOffset():]
+            new_req = self.helpers.buildHttpMessage(new_headers, body_bytes)
+            messageInfo.setRequest(new_req)
 
-        self._stdout.println("[!] 401 Detected. HALTING THREADS AND INITIATING REFRESH.")
-
-        # Extract old token to check if another thread already fixed it
-        req_info = self._helpers.analyzeRequest(messageInfo.getRequest())
-        old_token = None
-        for h in req_info.getHeaders():
-            if h.lower().startswith("authorization: bearer "):
-                old_token = h.split(" ", 2)[-1].strip()
-
-        # THREAD LOCK: Stop 50 intruder threads from spamming SSO simultaneously
-        with self.refresh_lock:
-            if self._jwt_token and self._jwt_token != old_token:
-                self._stdout.println("[+] Another thread already refreshed the token. Resuming.")
-            else:
-                success = self._perform_full_auth_flow()
-                if not success:
-                    self._stderr.println("[-] AUTH FLOW FAILED. Cannot retry request.")
+        else:
+            # IT'S A RESPONSE - CATCH 401 UNAUTHORIZED
+            resp_info = self.helpers.analyzeResponse(messageInfo.getResponse())
+            if resp_info.getStatusCode() == 401:
+                # To prevent endless 401 loops in case the server is just broken, check a custom marker
+                headers = list(self.helpers.analyzeRequest(messageInfo.getRequest()).getHeaders())
+                retry_count = 0
+                for h in headers:
+                    if h.lower().startswith("x-angry-retry:"):
+                        retry_count = int(h.split(":")[1].strip())
+                        
+                if retry_count > 0:
+                    self.ui_log("401 Loop Detected. Aborting retry for this specific request.")
                     return
 
-        # Token is refreshed. Re-issue the EXACT same request.
-        # _proactive_inject already runs on the outgoing request via makeHttpRequest!
-        self._retry_request(messageInfo)
-
-    # ----------------------------------------------------------
-    # RETRY LOGIC (INVISIBLE TO BURP TOOLS)
-    # ----------------------------------------------------------
-    def _retry_request(self, messageInfo):
-        try:
-            original_request = messageInfo.getRequest()
-            
-            # Manually apply new tokens to this specific retry buffer
-            req_info = self._helpers.analyzeRequest(original_request)
-            headers = list(req_info.getHeaders())
-            body_bytes = original_request[req_info.getBodyOffset():]
-            
-            new_headers = [headers[0]]
-            for hdr in headers[1:]:
-                lh = hdr.lower()
-                if lh.startswith("ostoken:"): continue
-                if lh.startswith("authorization:"):
-                    new_headers.append("Authorization: Bearer " + self._jwt_token)
-                    continue
-                if lh.startswith("cookie:") and self._jsessionid:
-                    if "jsessionid=" in lh:
-                        hdr = re.sub(r'(?i)(JSESSIONID=)[^;\s]+', r'\g<1>' + self._jsessionid, hdr)
-                    else:
-                        hdr = hdr + "; JSESSIONID=" + self._jsessionid
-                    new_headers.append(hdr)
-                    continue
-                new_headers.append(hdr)
-
-            retry_request = self._helpers.buildHttpMessage(new_headers, body_bytes)
-            http_service = messageInfo.getHttpService()
-            
-            # Fire the request
-            new_response = self._callbacks.makeHttpRequest(http_service, retry_request)
-            
-            # OVERWRITE the 401 response with the new 200 OK so Burp tools never see the failure!
-            messageInfo.setRequest(retry_request)
-            if new_response.getResponse():
-                messageInfo.setResponse(new_response.getResponse())
-                self._stdout.println("[+] Request retried successfully and invisible to scanner.")
-
-        except Exception as e:
-            self._stderr.println("[-] _retry_request error: " + str(e))
-
-    # ----------------------------------------------------------
-    # FULL 3-STEP AUTH FLOW
-    # ----------------------------------------------------------
-    def _perform_full_auth_flow(self):
-        self._stdout.println("[*] Step 1: Fetching Location URL from SSO...")
-        location_url = self._get_sso_location()
-        if not location_url: return False
-
-        self._stdout.println("[*] Step 2: Fetching JSESSIONID...")
-        jsessionid = self._fetch_jsessionid(location_url)
-        if not jsessionid: return False
-        self._jsessionid = jsessionid
-
-        self._stdout.println("[*] Step 3: Fetching JWT...")
-        jwt_token = self._fetch_jwt()
-        if not jwt_token: return False
-        self._jwt_token = jwt_token
-
-        self._stdout.println("[+] ALL TOKENS REFRESHED AND SAVED TO MEMORY.")
-        return True
-
-    def _get_sso_location(self):
-        try:
-            host = self._host(self.sso_url)
-            path = self._extract_path(self.sso_url)
-
-            headers = [
-                "GET " + path + " HTTP/1.1",
-                "Host: " + host,
-                "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:151.0) Gecko/20100101 Firefox/151.0",
-                "Accept: text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-                "Cookie: " + self.sso_cookies,
-                "Connection: close"
-            ]
-
-            response_bytes = self._make_request(self.sso_url, headers)
-            if not response_bytes: return None
-
-            resp_info = self._helpers.analyzeResponse(response_bytes)
-            for hdr in resp_info.getHeaders():
-                if hdr.lower().startswith("location:"):
-                    return hdr.split(":", 1)[1].strip()
-            self._stderr.println("[-] No Location header found in SSO response.")
-            return None
-        except Exception as e:
-            self._stderr.println("[-] _get_sso_location error: " + str(e))
-            return None
-
-    def _fetch_jsessionid(self, location_url):
-        try:
-            if location_url.startswith("/"):
-                location_url = self._scheme(self.sso_url) + "://" + self._host(self.sso_url) + location_url
-
-            headers = [
-                "GET " + self._extract_path(location_url) + " HTTP/1.1",
-                "Host: " + self._host(location_url),
-                "User-Agent: Mozilla/5.0",
-                "Cookie: " + self.sso_cookies,
-                "Connection: close"
-            ]
-
-            response_bytes = self._make_request(location_url, headers)
-            if not response_bytes: return None
-
-            resp_info = self._helpers.analyzeResponse(response_bytes)
-            if resp_info.getStatusCode() in [301, 302, 303, 307, 308]:
-                self._stderr.println("[-] WARNING: Location URL returned 302. Your sso_cookies are likely expired! Update them in the script.")
-                return None
-
-            for hdr in resp_info.getHeaders():
-                if "set-cookie" in hdr.lower() and "jsessionid" in hdr.lower():
-                    match = re.search(r'JSESSIONID=([^;,\s]+)', hdr, re.IGNORECASE)
-                    if match: return match.group(1)
-
-            self._stderr.println("[-] JSESSIONID not found in Set-Cookie header.")
-            return None
-        except Exception as e:
-            self._stderr.println("[-] _fetch_jsessionid error: " + str(e))
-            return None
-
-    def _fetch_jwt(self):
-        try:
-            headers = [
-                "GET " + self._extract_path(self.token_url) + " HTTP/1.1",
-                "Host: " + self._host(self.token_url),
-                "User-Agent: Mozilla/5.0",
-                "Accept: application/json",
-                "Cookie: JSESSIONID=" + self._jsessionid,
-                "Connection: close"
-            ]
-
-            response_bytes = self._make_request(self.token_url, headers)
-            if not response_bytes: return None
-
-            resp_info = self._helpers.analyzeResponse(response_bytes)
-            body_offset = resp_info.getBodyOffset()
-            resp_body = self._helpers.bytesToString(response_bytes[body_offset:])
-
-            try:
-                data = json.loads(resp_body)
-                return data.get("token")
-            except Exception as e:
-                self._stderr.println("[-] JSON parse error on JWT: " + str(e))
-                return None
-        except Exception as e:
-            self._stderr.println("[-] _fetch_jwt error: " + str(e))
-            return None
-
-    # ----------------------------------------------------------
-    # FAST UTILITY HELPERS
-    # ----------------------------------------------------------
-    def _make_request(self, url, headers):
-        try:
-            use_https = url.lower().startswith("https")
-            host = self._host(url)
-            port = 443 if use_https else 80
-            http_svc = self._helpers.buildHttpService(host, port, use_https)
-            req_bytes = self._helpers.buildHttpMessage(headers, None)
-            response = self._callbacks.makeHttpRequest(http_svc, req_bytes)
-            return response.getResponse() if response else None
-        except Exception as e:
-            # This catches the UnknownHostException gracefully instead of crashing Burp
-            self._stderr.println("[-] Network Error hitting " + str(url) + ": " + str(e))
-            return None
-
-    def _host(self, url):
-        return re.sub(r'^https?://', '', url).split("/")[0].split("?")[0]
-
-    def _scheme(self, url):
-        return "https" if url.lower().startswith("https") else "http"
-
-    def _extract_path(self, url):
-        match = re.match(r'^https?://[^/]+(.*)', url)
-        return match.group(1) if match and match.group(1) else "/"
+                self.ui_log("401 UNAUTHORIZED CAUGHT! Invalidating token and automatically retrying request...")
+                
+                # Invalidate
+                self.token_exp = 0 
+                
+                # Re-fetch
+                if self.fetch_new_token():
+                    # Reconstruct the failed request, inject the *new* token
+                    new_headers = []
+                    for h in headers:
+                        name = h.split(":")[0].lower().strip()
+                        if name == "authorization" or name == "x-angry-retry":
+                            continue
+                        if name == "cookie" and self.jsessionid:
+                            c_val = h.split(":", 1)[1].strip()
+                            c_val = re.sub(r"JSESSIONID=[^;]+", "JSESSIONID=" + self.jsessionid, c_val)
+                            new_headers.append("Cookie: " + c_val)
+                            continue
+                        new_headers.append(h)
+                        
+                    auth_format = self.txt_auth_format.getText()
+                    new_headers.append("Authorization: " + auth_format.format(self.jwt_token))
+                    new_headers.append("X-Angry-Retry: 1") # Mark to prevent infinite loops
+                    
+                    orig_req_info = self.helpers.analyzeRequest(messageInfo.getRequest())
+                    body_bytes = messageInfo.getRequest()[orig_req_info.getBodyOffset():]
+                    new_retry_req = self.helpers.buildHttpMessage(new_headers, body_bytes)
+                    
+                    # Fire it off
+                    new_resp = self.callbacks.makeHttpRequest(messageInfo.getHttpService(), new_retry_req)
+                    
+                    # SEAMLESSLY update Burp's UI so you never even see the 401 in Repeater/Intruder
+                    messageInfo.setRequest(new_retry_req)
+                    if new_resp and new_resp.getResponse():
+                        messageInfo.setResponse(new_resp.getResponse())
