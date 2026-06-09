@@ -40,7 +40,6 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab, IExtensionStateListener):
         self.log(">>> APEX SESSION MANAGER LOADED. Ready to crush the benchmark. <<<")
 
     def log(self, message):
-        # Console output for the weak who need to see what's happening
         self.stdout.println("[*] " + str(message))
 
     def getTabCaption(self):
@@ -101,7 +100,7 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab, IExtensionStateListener):
         # Request Mod Config
         pnl_req_mod = JPanel(GridLayout(2, 2, 5, 5))
         pnl_req_mod.setBorder(BorderFactory.createTitledBorder("2. Header Modifications (Comma Separated)"))
-        pnl_req_mod.add(JLabel("Headers to Strip (e.g. sec-ch-ua):"))
+        pnl_req_mod.add(JLabel("Headers to Strip:"))
         self.txt_strip_headers = JTextField("sec-ch-ua, sec-ch-ua-mobile, sec-ch-ua-platform, Sec-Fetch-Site, Sec-Fetch-Mode, Sec-Fetch-Dest")
         pnl_req_mod.add(self.txt_strip_headers)
         
@@ -157,7 +156,6 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab, IExtensionStateListener):
             self.btn_toggle.setText("STOP EXTENSION")
             self.btn_toggle.setBackground(Color(50, 150, 50))
             self.ui_log("Extension STARTED. Intercepting configured tools.")
-            # Trigger initial fetch asynchronously
             threading.Thread(target=self.fetch_new_token).start()
         else:
             self.btn_toggle.setText("START EXTENSION")
@@ -169,8 +167,6 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab, IExtensionStateListener):
         def update():
             self.txt_logs.append("[*] " + msg + "\n")
             self.txt_logs.setCaretPosition(self.txt_logs.getDocument().getLength())
-            
-            # Update status label
             status = "RUNNING" if self.is_running else "STOPPED"
             exp_time = time.strftime('%H:%M:%S', time.localtime(self.token_exp)) if self.token_exp > 0 else "NULL"
             self.lbl_status.setText(" Status: {} | Token Exp: {}".format(status, exp_time))
@@ -194,29 +190,27 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab, IExtensionStateListener):
             parts = token.split('.')
             if len(parts) < 2: return 0
             payload = parts[1]
-            payload += '=' * (-len(payload) % 4) # Fix padding for jython
+            payload += '=' * (-len(payload) % 4) 
             decoded = base64.urlsafe_b64decode(payload.encode('ascii'))
             data = json.loads(decoded.decode('utf-8'))
             return float(data.get('exp', 0))
         except Exception as e:
-            self.ui_log("JWT Decode Error (Your token is malformed!): " + str(e))
+            self.ui_log("JWT Decode Error: " + str(e))
             return 0
 
     def is_token_valid(self):
-        # 15 seconds buffer so we don't send an expiring token.
-        return self.jwt_token is not None and (self.token_exp - time.time()) > 15
+        return self.jwt_token is not None and self.jsessionid is not None and (self.token_exp - time.time()) > 15
 
     def make_call(self, host, port, is_https, req_bytes):
         service = self.helpers.buildHttpService(host, int(port), is_https)
         return self.callbacks.makeHttpRequest(service, req_bytes)
 
     def fetch_new_token(self):
-        # DOUBLE CHECKED LOCKING: The mark of a true optimized architecture.
+        # DOUBLE CHECKED LOCKING
         if self.is_token_valid():
             return True
 
         with self.lock:
-            # If 50 threads were waiting, 49 will see it's valid now and skip execution.
             if self.is_token_valid():
                 return True
                 
@@ -244,10 +238,10 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab, IExtensionStateListener):
                     break
             
             if not location:
-                self.ui_log("ERROR: Step 1 failed. No Location header found. Cookie expired?")
+                self.ui_log("ERROR: Step 1 failed. No Location header found. Update daily cookie?")
                 return False
                 
-            self.ui_log("Step 1 Success. Extracted Location: " + location[:50] + "...")
+            self.ui_log("Step 1 Success. Extracted Location Redirect.")
 
             # --- STEP 2 ---
             try:
@@ -276,7 +270,7 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab, IExtensionStateListener):
                 return False
 
             self.jsessionid = jsessionid
-            self.ui_log("Step 2 Success. Extracted JSESSIONID: " + self.jsessionid)
+            self.ui_log("Step 2 Success. Extracted NEW JSESSIONID: " + self.jsessionid)
 
             # --- STEP 3 ---
             req3_str = ("GET /transact-explorer-wa/token HTTP/1.1\r\n"
@@ -300,17 +294,17 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab, IExtensionStateListener):
                 if token:
                     self.jwt_token = token
                     self.token_exp = self.get_exp_from_jwt(token)
-                    self.ui_log("Step 3 Success! JWT Token extracted and cached. Expires: " + str(self.token_exp))
+                    self.ui_log("Step 3 Success! JWT Token cached. Expires: " + str(self.token_exp))
                     return True
                 else:
-                    self.ui_log("ERROR: Step 3 failed. JSON did not contain 'token' key. Body: " + body_str[:100])
+                    self.ui_log("ERROR: Step 3 failed. JSON did not contain 'token' key.")
             except Exception as e:
                 self.ui_log("ERROR: Step 3 failed. JSON parse error: " + str(e))
             
             return False
 
     # -------------------------------------------------------------------------
-    # REQUEST INTERCEPTION - Stripping headers, injecting Tokens flawlessly
+    # REQUEST INTERCEPTION & DEAD SESSION PREDATOR
     # -------------------------------------------------------------------------
     def processHttpMessage(self, toolFlag, messageIsRequest, messageInfo):
         if not self.is_running: return
@@ -319,20 +313,18 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab, IExtensionStateListener):
         req_info = self.helpers.analyzeRequest(messageInfo)
         file_path = req_info.getUrl().getFile()
         
-        # PREVENT INFINITE RECURSION - Do not touch the OAuth endpoints!
+        # DO NOT TOUCH CORE OAUTH FLOW
         if ("/sgconnect/oauth2/authorize" in file_path or 
             "/transact-explorer-wa/token" in file_path or 
             ("code=" in file_path and "session_state=" in file_path)):
             return
 
         if messageIsRequest:
-            # 1. Evaluate Token Status First (Fetch blocks if needed)
             if not self.is_token_valid():
                 if not self.fetch_new_token():
-                    self.log("Bypassing modification. Could not fetch token.")
+                    self.log("Bypassing mod. Could not fetch token.")
                     return
             
-            # 2. Modify Headers
             headers = list(req_info.getHeaders())
             strip_list = [h.strip().lower() for h in self.txt_strip_headers.getText().split(",") if h.strip()]
             
@@ -341,15 +333,10 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab, IExtensionStateListener):
             
             for h in headers:
                 name = h.split(":")[0].lower().strip()
-                
-                # Strip user defined headers
                 if name in strip_list:
                     continue
-                # Strip existing Authorization so we can overwrite
                 if name == "authorization":
                     continue
-                    
-                # Handle JSESSIONID overwrite for main domain
                 if name == "cookie" and self.jsessionid:
                     cookie_found = True
                     c_val = h.split(":", 1)[1].strip()
@@ -362,24 +349,32 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab, IExtensionStateListener):
 
                 new_headers.append(h)
                 
-            # Add JWT Token
             auth_format = self.txt_auth_format.getText()
             new_headers.append("Authorization: " + auth_format.format(self.jwt_token))
             
-            # Add JSESSIONID if no cookie header existed and we have one
             if not cookie_found and self.jsessionid and self.txt_main_host.getText().strip() in req_info.getUrl().getHost():
                 new_headers.append("Cookie: JSESSIONID=" + self.jsessionid)
                 
-            # Rebuild and set
             body_bytes = messageInfo.getRequest()[req_info.getBodyOffset():]
             new_req = self.helpers.buildHttpMessage(new_headers, body_bytes)
             messageInfo.setRequest(new_req)
 
         else:
-            # IT'S A RESPONSE - CATCH 401 UNAUTHORIZED
+            # IT'S A RESPONSE - CATCH 401 OR SSO REDIRECTS (DEAD SESSIONS)
             resp_info = self.helpers.analyzeResponse(messageInfo.getResponse())
-            if resp_info.getStatusCode() == 401:
-                # To prevent endless 401 loops in case the server is just broken, check a custom marker
+            status_code = resp_info.getStatusCode()
+            
+            is_sso_redirect = False
+            if status_code in [301, 302, 303, 307, 308]:
+                for h in resp_info.getHeaders():
+                    if h.lower().startswith("location:"):
+                        loc = h.split(":", 1)[1].strip()
+                        # THIS is where the magic happens. We caught the app trying to bounce you.
+                        if "/sgconnect/oauth2/authorize" in loc and "redirect_uri=" in loc:
+                            is_sso_redirect = True
+                            break
+
+            if status_code == 401 or is_sso_redirect:
                 headers = list(self.helpers.analyzeRequest(messageInfo.getRequest()).getHeaders())
                 retry_count = 0
                 for h in headers:
@@ -387,17 +382,21 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab, IExtensionStateListener):
                         retry_count = int(h.split(":")[1].strip())
                         
                 if retry_count > 0:
-                    self.ui_log("401 Loop Detected. Aborting retry for this specific request.")
+                    self.ui_log("Loop Detected! Aborting retry for this specific request to save CPU.")
                     return
 
-                self.ui_log("401 UNAUTHORIZED CAUGHT! Invalidating token and automatically retrying request...")
+                if is_sso_redirect:
+                    self.ui_log("SSO REDIRECT CAUGHT (Dead Session)! Intercepting bounce, trashing JSESSIONID...")
+                else:
+                    self.ui_log("401 UNAUTHORIZED CAUGHT! Invalidating token...")
                 
-                # Invalidate
+                # TOTAL ANNIHILATION OF OLD STATE
                 self.token_exp = 0 
+                self.jsessionid = None
                 
-                # Re-fetch
+                # Re-fetch completely
                 if self.fetch_new_token():
-                    # Reconstruct the failed request, inject the *new* token
+                    # Reconstruct the failed request, inject the completely new JSESSIONID and Token
                     new_headers = []
                     for h in headers:
                         name = h.split(":")[0].lower().strip()
@@ -412,16 +411,16 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab, IExtensionStateListener):
                         
                     auth_format = self.txt_auth_format.getText()
                     new_headers.append("Authorization: " + auth_format.format(self.jwt_token))
-                    new_headers.append("X-Angry-Retry: 1") # Mark to prevent infinite loops
+                    new_headers.append("X-Angry-Retry: 1") 
                     
                     orig_req_info = self.helpers.analyzeRequest(messageInfo.getRequest())
                     body_bytes = messageInfo.getRequest()[orig_req_info.getBodyOffset():]
                     new_retry_req = self.helpers.buildHttpMessage(new_headers, body_bytes)
                     
-                    # Fire it off
+                    # Fire it off. The user will literally never know their session died.
                     new_resp = self.callbacks.makeHttpRequest(messageInfo.getHttpService(), new_retry_req)
                     
-                    # SEAMLESSLY update Burp's UI so you never even see the 401 in Repeater/Intruder
+                    # Overwrite the Burp history item so you only see the successful execution
                     messageInfo.setRequest(new_retry_req)
                     if new_resp and new_resp.getResponse():
                         messageInfo.setResponse(new_resp.getResponse())
