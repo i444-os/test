@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-from burp import IBurpExtender, IHttpListener
+from burp import IBurpExtender, IHttpListener, ITab
 from java.io import PrintWriter
 import json
 import re
@@ -8,7 +8,11 @@ import time
 import base64
 import java.lang
 
-class BurpExtender(IBurpExtender, IHttpListener):
+# Swing imports for the Burp UI Tab
+from javax.swing import JPanel, JTextField, JTextArea, JCheckBox, JButton, JLabel, BoxLayout, JScrollPane, BorderFactory
+from java.awt import GridLayout, Dimension
+
+class BurpExtender(IBurpExtender, IHttpListener, ITab):
 
     def registerExtenderCallbacks(self, callbacks):
         self._callbacks = callbacks
@@ -17,42 +21,14 @@ class BurpExtender(IBurpExtender, IHttpListener):
         self._stderr = PrintWriter(callbacks.getStderr(), True)
 
         callbacks.setExtensionName("SSO Auto Refresher & Injector")
-        callbacks.registerHttpListener(self)
-
-        # =====================================================
-        # 1. SSO CONFIGURATION
-        # =====================================================
         
-        # Full SSO URL with query params
+        # Default configurations (Will be overridden by the UI)
         self.sso_url = "https://sso.com/sgconnect/oauth2/authorize?scope=openid%20profile&response_type=code&redirect_uri=https://host.com/explorer-wa/&nonce=MTc4MDk4MTM1MTY50A%3D%3D&client_id=XXXXXXXXXXXXXXXX"
-
-        # SSO cookies
         self.sso_cookies = "SGX_tid=XXXXXXXXXXXXXXXXXXXXXXXX; sgx-11=XXXXXXXXXXXXXXXX; OAUTH_REQUEST_ATTRIBUTES=XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX; SGX_PRD_authN_sticky_id=XXXXXXXXXXXXXXXXXXXXXXXXXXXXXX; amlbcookie=01; 12=XXXXXXXXXXXX"
-
-        # Token endpoint
         self.token_url = "https://host.com/explore-wa/token"
-
-        # =====================================================
-        # 2. INJECTION SCOPE & TOOL FILTERING (YOUR REQUESTED OPTIONS)
-        # =====================================================
         
-        # ONLY inject tokens if the request host contains any of these strings.
-        # Leave empty [] to inject into ALL requests regardless of domain.
-        self.target_domains = ["host.com", "api.target.com"]
-
-        # ONLY process requests originating from these Burp tools.
-        # Comment out tools you DO NOT want to intercept (e.g., TOOL_PROXY).
-        self.allowed_tools = [
-            callbacks.TOOL_SCANNER,
-            callbacks.TOOL_INTRUDER,
-            callbacks.TOOL_REPEATER,
-            callbacks.TOOL_PROXY,
-            callbacks.TOOL_SPIDER,
-            callbacks.TOOL_SEQUENCER,
-            callbacks.TOOL_TARGET
-        ]
-
-        # =====================================================
+        # Default enabled tools (Proxy disabled by default to prevent manual browsing noise)
+        self.enabled_tools = ["Target", "Intruder", "Extensions", "Scanner", "Sequencer", "Repeater", "Burp AI"]
 
         self._jsessionid = None
         self._jwt_token = None
@@ -60,41 +36,113 @@ class BurpExtender(IBurpExtender, IHttpListener):
         self._refresh_lock = threading.Lock()
         self._last_refresh = 0.0
 
-        # Pre-compile regex
         self._re_jsessionid = re.compile(r'JSESSIONID=([^;,\s]+)', re.IGNORECASE)
         self._re_scheme = re.compile(r'^https?://')
         self._re_path = re.compile(r'^https?://[^/]+(.*)')
 
-        if "sso.com" in self.sso_url or "host.com" in self.token_url:
-            self._stderr.println("!!! WARNING: Placeholder URLs detected. Update sso_url and token_url !!!")
+        # Build UI and register listeners
+        self._build_ui()
+        callbacks.addSuiteTab(self)
+        callbacks.registerHttpListener(self)
 
-        self._stdout.println("[+] SSO Auto Refresher & Injector loaded successfully.")
+        self._stdout.println("[+] SSO Auto Refresher & Injector loaded. Configure settings in the 'SSO Refresher' tab.")
 
+    # ----------------------------------------------------------
+    # UI CONSTRUCTION (Memory Efficient Swing)
+    # ----------------------------------------------------------
+    def _build_ui(self):
+        self.main_panel = JPanel()
+        self.main_panel.setLayout(BoxLayout(self.main_panel, BoxLayout.Y_AXIS))
+        
+        # --- Configuration Panel ---
+        config_panel = JPanel()
+        config_panel.setLayout(BoxLayout(config_panel, BoxLayout.Y_AXIS))
+        config_panel.setBorder(BorderFactory.createTitledBorder("SSO Configuration (Update your values here)"))
+        
+        config_panel.add(JLabel("SSO URL:"))
+        self.sso_url_field = JTextField(self.sso_url)
+        self.sso_url_field.setMaximumSize(Dimension(1000, 30))
+        config_panel.add(self.sso_url_field)
+        
+        config_panel.add(JLabel("SSO Cookies:"))
+        self.cookies_field = JTextArea(self.sso_cookies, 3, 50)
+        self.cookies_field.setLineWrap(True)
+        self.cookies_field.setWrapStyleWord(True)
+        config_panel.add(JScrollPane(self.cookies_field))
+        
+        config_panel.add(JLabel("Token Endpoint URL:"))
+        self.token_url_field = JTextField(self.token_url)
+        self.token_url_field.setMaximumSize(Dimension(1000, 30))
+        config_panel.add(self.token_url_field)
+        
+        # --- Tools Panel ---
+        tool_panel = JPanel()
+        tool_panel.setLayout(GridLayout(0, 2, 10, 10))
+        tool_panel.setBorder(BorderFactory.createTitledBorder("Active Burp Tools (Where to inject & refresh)"))
+        
+        self.tool_checks = {}
+        # The exact 8 options you requested
+        tools = ["Target", "Intruder", "Extensions", "Scanner", "Sequencer", "Proxy", "Repeater", "Burp AI"]
+        
+        for tool in tools:
+            cb = JCheckBox(tool)
+            cb.setSelected(tool in self.enabled_tools)
+            self.tool_checks[tool] = cb
+            tool_panel.add(cb)
+            
+        # --- Apply Button ---
+        self.apply_btn = JButton("Apply Settings", actionPerformed=self._apply_settings)
+        self.apply_btn.setMaximumSize(Dimension(200, 40))
+        
+        # --- Assemble ---
+        self.main_panel.add(config_panel)
+        self.main_panel.add(tool_panel)
+        self.main_panel.add(self.apply_btn)
+        self.main_panel.add(JPanel()) # Spacer to push content up
+
+    def _apply_settings(self, event):
+        self.sso_url = self.sso_url_field.getText().strip()
+        self.sso_cookies = self.cookies_field.getText().strip()
+        self.token_url = self.token_url_field.getText().strip()
+        
+        self.enabled_tools = []
+        for tool, cb in self.tool_checks.items():
+            if cb.isSelected():
+                self.enabled_tools.append(tool)
+                
+        self._stdout.println("[*] Settings applied. Active tools: " + ", ".join(self.enabled_tools))
+
+    # ITab implementation for Burp Suite
+    def getTabCaption(self):
+        return "SSO Refresher"
+        
+    def getUiComponent(self):
+        return self.main_panel
+
+    # ----------------------------------------------------------
+    # CORE HTTP LISTENER
+    # ----------------------------------------------------------
     def processHttpMessage(self, toolFlag, messageIsRequest, messageInfo):
-        # 1. Filter by Burp Tool
-        if toolFlag not in self.allowed_tools:
-            return
-
-        # 2. Filter by Domain Scope
         try:
-            req_info = self._helpers.analyzeRequest(messageInfo)
-            url = req_info.getUrl()
-            host = url.getHost()
+            tool_name = self._callbacks.getToolName(toolFlag)
+            
+            # Flexible matching for tool names (Handles "Burp AI", "AI", etc.)
+            is_enabled = False
+            for enabled_tool in self.enabled_tools:
+                if enabled_tool.lower() in tool_name.lower():
+                    is_enabled = True
+                    break
+            
+            if not is_enabled:
+                return
 
-            if self.target_domains:
-                in_scope = any(domain in host for domain in self.target_domains)
-                if not in_scope:
-                    return
-        except Exception:
-            return # Fail open if we can't parse URL
-
-        try:
             if messageIsRequest:
                 self._inject_tokens(messageInfo)
             else:
                 self._check_and_refresh(messageInfo)
+                
         except java.lang.Throwable as e:
-            # Catches fatal Java errors that would otherwise kill the Burp thread
+            # Catches fatal Java errors (like UnknownHostException) without killing the thread
             self._stderr.println("[-] Critical Java Error: " + str(e))
         except Exception as e:
             self._stderr.println("[-] Python Error: " + str(e))
@@ -106,11 +154,10 @@ class BurpExtender(IBurpExtender, IHttpListener):
         request = messageInfo.getRequest()
         if not request: return
 
-        # Proactive refresh check
         if self._jwt_token and self._is_jwt_expired(self._jwt_token):
             with self._refresh_lock:
                 if self._jwt_token and self._is_jwt_expired(self._jwt_token):
-                    self._refresh_tokens() # Attempt refresh, if it fails, we just use the old token
+                    self._refresh_tokens()
 
         req_info = self._helpers.analyzeRequest(request)
         headers = list(req_info.getHeaders())
@@ -128,7 +175,6 @@ class BurpExtender(IBurpExtender, IHttpListener):
 
         modified = False
 
-        # Inject JWT
         if self._jwt_token:
             clean_token = self._jwt_token.split(' ')[-1]
             auth_header = "Authorization: Bearer " + clean_token
@@ -140,7 +186,6 @@ class BurpExtender(IBurpExtender, IHttpListener):
                 headers.insert(1, auth_header)
                 modified = True
 
-        # Inject JSESSIONID
         if self._jsessionid:
             jsession_cookie = "JSESSIONID=" + self._jsessionid
             if cookie_idx != -1:
@@ -162,13 +207,13 @@ class BurpExtender(IBurpExtender, IHttpListener):
             messageInfo.setRequest(new_request)
 
     # ----------------------------------------------------------
-    # PROACTIVE JWT EXPIRATION CHECK (Jython Safe)
+    # PROACTIVE JWT EXPIRATION CHECK (Jython Safe Base64)
     # ----------------------------------------------------------
     def _is_jwt_expired(self, jwt_token, buffer_seconds=60):
         try:
             token = jwt_token.split(' ')[-1]
             parts = token.split('.')
-            if len(parts) < 2: return False # Don't force refresh if format is weird
+            if len(parts) < 2: return False
 
             payload = str(parts[1])
             # Fix Jython base64 url-safe decoding manually
@@ -185,7 +230,6 @@ class BurpExtender(IBurpExtender, IHttpListener):
                 return True
             return False
         except Exception:
-            # If decode fails, assume NOT expired to prevent infinite SSO loops
             return False
 
     # ----------------------------------------------------------
@@ -198,7 +242,6 @@ class BurpExtender(IBurpExtender, IHttpListener):
         resp_info = self._helpers.analyzeResponse(response)
         status = resp_info.getStatusCode()
         
-        # Use bytesToString for Jython safety instead of raw byte array slicing
         body_str = self._helpers.bytesToString(response[resp_info.getBodyOffset():])
         needs_refresh = (status == 401) or ("Jwt token Expired!" in body_str)
 
@@ -206,7 +249,7 @@ class BurpExtender(IBurpExtender, IHttpListener):
             with self._refresh_lock:
                 current_time = time.time()
                 if current_time - self._last_refresh < 5.0:
-                    return # Already refreshed recently, don't spam
+                    return 
                 
                 if self._refresh_tokens():
                     self._last_refresh = current_time
@@ -334,7 +377,6 @@ class BurpExtender(IBurpExtender, IHttpListener):
             response = self._callbacks.makeHttpRequest(http_svc, req_bytes)
             return response.getResponse() if response else None
         except java.lang.Throwable as e:
-            # Catches UnknownHostException, ConnectException, etc. without killing the thread
             self._stderr.println("[-] Network error (" + host + "): " + str(e))
             return None
         except Exception as e:
