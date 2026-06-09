@@ -5,6 +5,7 @@ import json
 import re
 import threading
 import time
+import base64
 
 class BurpExtender(IBurpExtender, IHttpListener):
 
@@ -37,9 +38,9 @@ class BurpExtender(IBurpExtender, IHttpListener):
         
         # Thread safety lock & timestamp to prevent concurrent refresh loops
         self._refresh_lock = threading.Lock()
-        self._last_refresh = 0
+        self._last_refresh = 0.0
 
-        # Pre-compile regex patterns for memory efficiency and speed
+        # Pre-compile regex patterns
         self._re_jsessionid = re.compile(r'JSESSIONID=([^;,\s]+)', re.IGNORECASE)
         self._re_scheme = re.compile(r'^https?://')
         self._re_path = re.compile(r'^https?://[^/]+(.*)')
@@ -63,6 +64,15 @@ class BurpExtender(IBurpExtender, IHttpListener):
     # INJECT TOKENS (Runs on every outgoing request)
     # ----------------------------------------------------------
     def _inject_tokens(self, messageInfo):
+        # Proactively check if JWT is expired before injecting to prevent scanner misses
+        if self._jwt_token and self._is_jwt_expired(self._jwt_token):
+            with self._refresh_lock:
+                # Double check after acquiring lock to prevent thundering herd
+                if self._jwt_token and self._is_jwt_expired(self._jwt_token):
+                    self._stdout.println("[*] JWT proactively detected as expired. Refreshing before request...")
+                    if not self._refresh_tokens():
+                        self._stderr.println("[-] Proactive refresh failed. Using old token.")
+
         request = messageInfo.getRequest()
         req_info = self._helpers.analyzeRequest(request)
         headers = list(req_info.getHeaders())
@@ -83,7 +93,9 @@ class BurpExtender(IBurpExtender, IHttpListener):
         
         # Inject or replace JWT Token
         if self._jwt_token:
-            auth_header = "Authorization: Bearer " + self._jwt_token
+            # Ensure we don't end up with "Bearer Bearer ey..."
+            clean_token = self._jwt_token.split(' ')[-1] if ' ' in self._jwt_token else self._jwt_token
+            auth_header = "Authorization: Bearer " + clean_token
             if auth_idx != -1:
                 if headers[auth_idx] != auth_header:
                     headers[auth_idx] = auth_header
@@ -97,7 +109,7 @@ class BurpExtender(IBurpExtender, IHttpListener):
             jsession_cookie = "JSESSIONID=" + self._jsessionid
             if cookie_idx != -1:
                 cookie_header = headers[cookie_idx]
-                if "JSESSIONID=" in cookie_header:
+                if "JSESSIONID=" in cookie_header.upper():
                     # Regex replacement for existing JSESSIONID
                     new_cookie = self._re_jsessionid.sub("JSESSIONID=" + self._jsessionid, cookie_header)
                     if new_cookie != cookie_header:
@@ -114,6 +126,37 @@ class BurpExtender(IBurpExtender, IHttpListener):
         if modified:
             new_request = self._helpers.buildHttpMessage(headers, body)
             messageInfo.setRequest(new_request)
+
+    # ----------------------------------------------------------
+    # PROACTIVE JWT EXPIRATION CHECK
+    # ----------------------------------------------------------
+    def _is_jwt_expired(self, jwt_token, buffer_seconds=60):
+        try:
+            # JWT might be "Bearer ey..." or just "ey..."
+            token = jwt_token.split(' ')[-1] 
+            parts = token.split('.')
+            if len(parts) < 2:
+                return True # Invalid JWT format
+                
+            payload = parts[1]
+            # Add base64 padding if necessary
+            rem = len(payload) % 4
+            if rem > 0:
+                payload += '=' * (4 - rem)
+                
+            decoded_bytes = base64.urlsafe_b64decode(payload)
+            payload_json = json.loads(decoded_bytes)
+            
+            # Check 'exp' claim (seconds since epoch)
+            exp = payload_json.get('exp')
+            if exp:
+                if time.time() >= float(exp) - buffer_seconds:
+                    return True
+            
+            return False
+        except Exception as e:
+            self._stderr.println("[-] JWT decode error: " + str(e))
+            return True # Force refresh if we can't decode
 
     # ----------------------------------------------------------
     # CHECK AND REFRESH (Runs on every incoming response)
@@ -145,7 +188,7 @@ class BurpExtender(IBurpExtender, IHttpListener):
                     self._retry_request(messageInfo)
                     return
                     
-                self._stdout.println("[!] Token expired or 401 detected. Refreshing...")
+                self._stdout.println("[!] Token expired or 401 detected in response. Refreshing...")
                 if self._refresh_tokens():
                     self._last_refresh = current_time
                     self._retry_request(messageInfo)
@@ -180,6 +223,7 @@ class BurpExtender(IBurpExtender, IHttpListener):
         
         if new_response and new_response.getResponse():
             messageInfo.setResponse(new_response.getResponse())
+            self._stdout.println("[+] Request retried successfully.")
 
     # ----------------------------------------------------------
     # SSO FLOW METHODS
@@ -289,9 +333,7 @@ class BurpExtender(IBurpExtender, IHttpListener):
             status = resp_info.getStatusCode()
             
             if status in [301, 302, 303, 307, 308]:
-                self._stdout.println("[*] 302 on token endpoint - JSESSIONID expired. Restarting SSO flow...")
-                if self._refresh_tokens():
-                    return self._jwt_token
+                self._stderr.println("[-] 302 on token endpoint. JSESSIONID invalid or SSO cookies expired. Please update sso_cookies.")
                 return None
 
             body_offset = resp_info.getBodyOffset()
@@ -320,7 +362,8 @@ class BurpExtender(IBurpExtender, IHttpListener):
             host = self._host(url)
             port = 443 if use_https else 80
             http_svc = self._helpers.buildHttpService(host, port, use_https)
-            body_bytes = self._helpers.stringToBytes(body) if body else None
+            # Use empty string byte array instead of None to prevent Jython type mapping issues
+            body_bytes = self._helpers.stringToBytes(body) if body else self._helpers.stringToBytes("")
             req_bytes = self._helpers.buildHttpMessage(headers, body_bytes)
             response = self._callbacks.makeHttpRequest(http_svc, req_bytes)
             return response.getResponse() if response else None
