@@ -1,1050 +1,1048 @@
-# -*- coding: utf-8 -*-
-"""
-OAuth2 Auto-Token Manager v2 - Burp Suite Extension
-Jython 2.7.4 Standalone Compatible
+# ================================================================
+# Burp Suite Header & Parameter Stripper Extension
+# Compatible with Jython 2.7.4
+# Version: 1.0.0
+# ================================================================
+#
+# Features:
+#   - Remove specified headers from HTTP requests
+#   - Remove specified parameters from HTTP requests (future-ready)
+#   - Select which Burp tools to apply stripping to
+#   - Start/Stop extension at any time
+#   - Case-sensitive / Case-insensitive matching
+#   - Regex pattern matching mode
+#   - Partial (substring) matching mode
+#   - Activity log with auto-scroll
+#   - Live statistics counter
+#   - Import/Export configuration files
+#   - Select All / Deselect All tool checkboxes
+#   - Thread-safe operation with proper Swing EDT handling
+#
+# Usage:
+#   1. Load in Burp Suite: Extender -> Extensions -> Add -> Python
+#   2. Select this file as the extension
+#   3. Configure headers/parameters to strip in the "H&P Stripper" tab
+#   4. Select which Burp tools should have stripping applied
+#   5. Click "Start" to begin processing
+#
+# Jython 2.7.4 Compatibility Notes:
+#   - No f-strings (Python 3.6+)
+#   - No super() without arguments in old-style classes
+#   - Java List slicing requires conversion to Python list first
+#   - Use .append() not .add() for Python lists
+#   - Swing UI updates must run on EDT via SwingUtilities.invokeLater
+#   - threading.Lock supports context manager (with statement)
+#   - re module is available and works identically to CPython 2.7
+# ================================================================
 
-3-Step OAuth2 Flow:
-  Step 1: GET /oauth2/authorize (SSO cookies) -> 302 redirect with code
-  Step 2: GET /app-base-path/?code=... -> 200, Set-Cookie: JSESSIONID + INGRESSCOOKIE
-  Step 3: GET /app-base-path/token (JSESSIONID) -> JSON with JWT
-
-Features:
-  - Caches JWT until expiry (exp claim) or 401; auto-refreshes lazily
-  - Injects Authorization: Bearer <jwt> into all requests targeting main domain
-  - Replaces JSESSIONID + INGRESSCOOKIE in Cookie headers on main domain
-  - Two-level header removal: "All Requests" (global) + "Main Domain Only"
-  - Configurable tool scope checkboxes (Proxy, Repeater, Intruder, Scanner, etc.)
-  - Start / Stop / Force Refresh controls
-  - 30-second cooldown after failed refresh
-  - Thread-safe token cache with lazy refresh
-  - Memory-bounded log (auto-trims at 50KB)
-  - Swing UI tab (Active Scan++ / Gitleaks style)
-"""
-
-from burp import IBurpExtender, ITab, IHttpListener
-from javax.swing import (
-    JPanel, JButton, JTextField, JLabel, JCheckBox,
-    JTextArea, JScrollPane, BorderFactory, BoxLayout, Box,
-    SwingUtilities, JComboBox
-)
-from javax.swing.border import TitledBorder, EmptyBorder, EtchedBorder, MatteBorder
-from java.awt import (
-    GridBagLayout, GridBagConstraints, Insets, FlowLayout,
-    BorderLayout, Dimension, Font, Color, GridLayout
-)
-from java.net import URLEncoder, URL
-import json
-import base64
-import time
-import threading
+from burp import IBurpExtender, ITab, IHttpListener, IExtensionStateListener
+from java.awt import (Dimension, Font, Color, FlowLayout, BorderLayout,
+                       GridBagLayout, GridBagConstraints, Insets)
+from javax.swing import (JPanel, JLabel, JCheckBox, JButton, JTextArea,
+                          JScrollPane, JTabbedPane, SwingUtilities,
+                          JTextField, JComboBox, Box)
+from javax.swing.border import EmptyBorder, TitledBorder, EtchedBorder, CompoundBorder
+from javax.swing.filechooser import FileNameExtensionFilter
+from java.awt.event import ActionListener
+from java.lang import Runnable
 import re
+import threading
+import time
+
+# ============================================================
+# Burp Suite Tool Flag Constants
+# ============================================================
+TOOL_TARGET = 1       # Not officially in IBurpExtenderCallbacks but commonly used
+TOOL_PROXY = 2
+TOOL_SPIDER = 3
+TOOL_SCANNER = 4
+TOOL_INTRUDER = 5
+TOOL_REPEATER = 6
+TOOL_SEQUENCER = 7
+TOOL_DECODER = 8
+TOOL_COMPARER = 9
+TOOL_EXTENDER = 10
+
+# Ordered tool mapping for UI display (matches user's requested order)
+TOOL_MAP_ORDERED = [
+    (TOOL_TARGET,    "Target"),
+    (TOOL_INTRUDER,  "Intruder"),
+    (TOOL_EXTENDER,  "Extensions"),
+    (TOOL_SCANNER,   "Scanner"),
+    (TOOL_SEQUENCER, "Sequencer"),
+    (TOOL_PROXY,     "Proxy (use with caution)"),
+    (TOOL_REPEATER,  "Repeater"),
+]
+
+# Parameter type constants (Burp API IParameter)
+PARAM_URL = 0
+PARAM_BODY = 1
+PARAM_COOKIE = 2
+PARAM_XML = 3
+PARAM_XML_ATTR = 4
+PARAM_MULTIPART_ATTR = 5
+PARAM_JSON = 6
+
+PARAM_TYPE_NAMES = {
+    PARAM_URL: "URL",
+    PARAM_BODY: "Body",
+    PARAM_COOKIE: "Cookie",
+    PARAM_XML: "XML",
+    PARAM_XML_ATTR: "XMLAttr",
+    PARAM_MULTIPART_ATTR: "Multipart",
+    PARAM_JSON: "JSON",
+}
 
 
-# ---------------------------------------------------------------------------
-# Runnable helpers for Swing EDT safety (Jython 2.7 duck-typing approach)
-# ---------------------------------------------------------------------------
+# ============================================================
+# Core Matching Logic (extracted for testability)
+# ============================================================
 
-class _RunnableUpdateStatus(object):
-    def __init__(self, ext, text):
-        self._ext = ext
-        self._text = text
-    def run(self):
-        self._ext._lbl_status.setText("Status: %s" % self._text)
+def should_match(name, patterns, case_sensitive, regex_mode, partial_match):
+    """
+    Check if a name matches any of the given patterns.
+
+    This is the core matching engine. It supports three modes:
+      - Exact match (default): name must equal pattern (case-insensitive by default)
+      - Partial match: pattern must be a substring of name
+      - Regex match: pattern is treated as a regular expression
+
+    Args:
+        name: The header name or parameter name to check (string)
+        patterns: List of pattern strings to match against
+        case_sensitive: If True, match is case-sensitive
+        regex_mode: If True, patterns are treated as regex
+        partial_match: If True, patterns match as substrings
+
+    Returns:
+        True if name matches any pattern, False otherwise
+    """
+    if not patterns:
+        return False
+
+    for pattern in patterns:
+        if not pattern:
+            continue
+
+        if regex_mode:
+            try:
+                flags = 0 if case_sensitive else re.IGNORECASE
+                if re.search(pattern, name, flags):
+                    return True
+            except re.error:
+                # Invalid regex pattern - skip it silently
+                continue
+        elif partial_match:
+            if case_sensitive:
+                if pattern in name:
+                    return True
+            else:
+                if pattern.lower() in name.lower():
+                    return True
+        else:
+            # Exact match mode
+            if case_sensitive:
+                if name == pattern:
+                    return True
+            else:
+                if name.lower() == pattern.lower():
+                    return True
+
+    return False
 
 
-class _RunnableUpdateTokenInfo(object):
-    def __init__(self, ext, text):
-        self._ext = ext
-        self._text = text
-    def run(self):
-        self._ext._lbl_token_info.setText(self._text)
+def parse_text_entries(text, is_header=False):
+    """
+    Parse text area content into a list of cleaned entries.
+
+    Rules:
+      - Blank lines are ignored
+      - Lines starting with # are comments (ignored)
+      - For headers: trailing colons are stripped, "Name: Value" entries
+        are cleaned to just "Name"
+      - Whitespace is trimmed
+
+    Args:
+        text: Raw text from the text area
+        is_header: If True, apply header-specific cleaning (strip colons/values)
+
+    Returns:
+        List of cleaned entry strings
+    """
+    if not text or not text.strip():
+        return []
+
+    entries = []
+    for line in text.split("\n"):
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+
+        if is_header:
+            # Strip trailing colon (e.g., "Authorization:" -> "Authorization")
+            if line.endswith(":"):
+                line = line[:-1].strip()
+            # Handle "Name: Value" pattern (e.g., "Authorization: Bearer xxx")
+            # Only strip if there's a space after the colon, indicating a value
+            if ": " in line:
+                line = line.split(": ", 1)[0].strip()
+
+        if line:
+            entries.append(line)
+
+    return entries
 
 
-class _RunnableAppendLog(object):
-    def __init__(self, ext, line):
-        self._ext = ext
-        self._line = line
-    def run(self):
-        current = self._ext._txt_log.getText()
-        if len(current) > 50000:
-            current = current[-25000:]
-        self._ext._txt_log.setText(current + self._line + "\n")
-        doc = self._ext._txt_log.getDocument()
-        self._ext._txt_log.setCaretPosition(doc.getLength())
-
-
-# ---------------------------------------------------------------------------
+# ============================================================
 # Main Extension Class
-# ---------------------------------------------------------------------------
+# ============================================================
 
-class BurpExtender(IBurpExtender, ITab, IHttpListener):
+class BurpExtender(IBurpExtender, ITab, IHttpListener, IExtensionStateListener):
+    """
+    Burp Suite extension for stripping headers and parameters from HTTP requests.
 
-    TOOL_PROXY     = 4
-    TOOL_SCANNER   = 16
-    TOOL_INTRUDER  = 32
-    TOOL_REPEATER  = 64
-    TOOL_SEQUENCER = 128
-    TOOL_EXTENDER  = 256
-    TOOL_TARGET    = 8
-
-    REFRESH_COOLDOWN = 30
-    TOKEN_BUFFER     = 30
-
-    # ------------------------------------------------------------------
-    # IBurpExtender
-    # ------------------------------------------------------------------
+    Implements:
+      - IBurpExtender: Required entry point for all Burp extensions
+      - ITab: Provides a custom UI tab in Burp's main window
+      - IHttpListener: Intercepts HTTP messages passing through Burp
+      - IExtensionStateListener: Handles extension unload events
+    """
 
     def registerExtenderCallbacks(self, callbacks):
+        """
+        Entry point called by Burp Suite when the extension is loaded.
+        Initializes all state, builds UI, and registers listeners.
+        """
         self._callbacks = callbacks
-        self._helpers   = callbacks.getHelpers()
+        self._helpers = callbacks.getHelpers()
+        self._is_running = False
+        self._lock = threading.Lock()
 
-        self._running              = False
-        self._token_cache          = None
-        self._token_expiry         = 0
-        self._jsessionid           = None
-        self._ingresscookie        = None
-        self._last_refresh_attempt = 0
-        self._refresh_count        = 0
-        self._token_lock           = threading.Lock()
-        self._refreshing           = False
+        # Statistics counters (thread-safe via _stats_lock)
+        self._stats_headers_removed = 0
+        self._stats_params_removed = 0
+        self._stats_requests_processed = 0
+        self._stats_lock = threading.Lock()
 
-        callbacks.setExtensionName("OAuth2 Auto-Token Manager")
+        # Activity log (thread-safe via _log_lock)
+        self._log_entries = []
+        self._log_lock = threading.Lock()
+
+        # Set extension name
+        callbacks.setExtensionName("H&P Stripper")
+
+        # Build the UI
         self._build_ui()
+
+        # Register listeners
         callbacks.registerHttpListener(self)
+        callbacks.registerExtensionStateListener(self)
+
+        # Add our custom tab to Burp's UI
         callbacks.addSuiteTab(self)
 
-        self._log("OAuth2 Auto-Token Manager v2 loaded.")
-        self._log("Configure settings and click 'Start' to begin.")
+        # Auto-start the extension
+        self._start_extension()
 
-    # ------------------------------------------------------------------
-    # ITab
-    # ------------------------------------------------------------------
+        self._add_log("INFO", "Extension loaded successfully. Version 1.0.0")
+        self._add_log("INFO", "Configure headers/parameters to strip, select tools, then click Start.")
 
-    def getTabCaption(self):
-        return "OAuth2 Token"
+    # ============================================================
+    # UI Construction
+    # ============================================================
 
-    def getUiComponent(self):
-        return self._main_panel
+    def _build_ui(self):
+        """Build the complete extension UI panel."""
+        self._panel = JPanel(BorderLayout(5, 5))
+        self._panel.setBorder(EmptyBorder(8, 8, 8, 8))
 
-    # ------------------------------------------------------------------
-    # IHttpListener
-    # ------------------------------------------------------------------
+        # NORTH: Control panel (tool checkboxes + start/stop)
+        self._panel.add(self._build_control_panel(), BorderLayout.NORTH)
+
+        # CENTER: Tabbed pane for Header and Parameter configuration
+        self._tabbed_pane = JTabbedPane()
+        self._tabbed_pane.addTab("Header Stripper", self._build_header_panel())
+        self._tabbed_pane.addTab("Parameter Stripper", self._build_parameter_panel())
+        self._panel.add(self._tabbed_pane, BorderLayout.CENTER)
+
+        # SOUTH: Statistics + Activity log
+        south_panel = JPanel(BorderLayout(5, 5))
+        south_panel.add(self._build_stats_panel(), BorderLayout.NORTH)
+        south_panel.add(self._build_log_panel(), BorderLayout.CENTER)
+        self._panel.add(south_panel, BorderLayout.SOUTH)
+
+    def _build_header_panel(self):
+        """Build the header stripping configuration panel."""
+        panel = JPanel(BorderLayout(5, 5))
+        panel.setBorder(EmptyBorder(8, 8, 8, 8))
+
+        # Info label
+        info = JLabel(
+            "<html><b>Enter header names to remove</b> (one per line, "
+            "case-insensitive by default)<br/>"
+            "Lines starting with # are comments. "
+            "Examples: X-Forwarded-For, Authorization, Cookie, Accept-Encoding</html>"
+        )
+        panel.add(info, BorderLayout.NORTH)
+
+        # Text area for header names
+        self._header_text = JTextArea(12, 40)
+        self._header_text.setFont(Font("Monospaced", Font.PLAIN, 13))
+        self._header_text.setToolTipText(
+            "Enter one header name per line to remove from requests. "
+            "Use # for comments."
+        )
+        scroll = JScrollPane(self._header_text)
+        scroll.setBorder(CompoundBorder(
+            TitledBorder(EtchedBorder(), "Headers to Remove"),
+            EmptyBorder(5, 5, 5, 5)
+        ))
+        panel.add(scroll, BorderLayout.CENTER)
+
+        # Options row
+        opts = JPanel(FlowLayout(FlowLayout.LEFT, 6, 2))
+
+        self._header_case_sensitive = JCheckBox("Case-sensitive", False)
+        self._header_regex_mode = JCheckBox("Regex mode", False)
+        self._header_partial_match = JCheckBox("Partial match", False)
+
+        self._header_case_sensitive.setToolTipText(
+            "Match header names exactly (case-sensitive)"
+        )
+        self._header_regex_mode.setToolTipText(
+            "Treat each entry as a regular expression pattern"
+        )
+        self._header_partial_match.setToolTipText(
+            "Match if the header name contains the pattern as a substring"
+        )
+
+        opts.add(JLabel("Matching:"))
+        opts.add(self._header_case_sensitive)
+        opts.add(self._header_regex_mode)
+        opts.add(self._header_partial_match)
+
+        # Separator
+        opts.add(JLabel("   "))
+
+        # Import/Export buttons
+        import_btn = JButton("Import")
+        export_btn = JButton("Export")
+        import_btn.setToolTipText("Import header list from a text file")
+        export_btn.setToolTipText("Export header list to a text file")
+        import_btn.addActionListener(ImportListener(self, "header"))
+        export_btn.addActionListener(ExportListener(self, "header"))
+        opts.add(import_btn)
+        opts.add(export_btn)
+
+        panel.add(opts, BorderLayout.SOUTH)
+        return panel
+
+    def _build_parameter_panel(self):
+        """Build the parameter stripping configuration panel."""
+        panel = JPanel(BorderLayout(5, 5))
+        panel.setBorder(EmptyBorder(8, 8, 8, 8))
+
+        # Info label
+        info = JLabel(
+            "<html><b>Enter parameter names to remove</b> (one per line, "
+            "case-insensitive by default)<br/>"
+            "Lines starting with # are comments. "
+            "Examples: tracking_id, session, debug, utm_source</html>"
+        )
+        panel.add(info, BorderLayout.NORTH)
+
+        # Text area for parameter names
+        self._param_text = JTextArea(12, 40)
+        self._param_text.setFont(Font("Monospaced", Font.PLAIN, 13))
+        self._param_text.setToolTipText(
+            "Enter one parameter name per line to remove from requests. "
+            "Use # for comments."
+        )
+        scroll = JScrollPane(self._param_text)
+        scroll.setBorder(CompoundBorder(
+            TitledBorder(EtchedBorder(), "Parameters to Remove"),
+            EmptyBorder(5, 5, 5, 5)
+        ))
+        panel.add(scroll, BorderLayout.CENTER)
+
+        # Options row - parameter types + matching options
+        opts = JPanel(FlowLayout(FlowLayout.LEFT, 6, 2))
+
+        # Parameter type checkboxes
+        self._param_url = JCheckBox("URL", True)
+        self._param_body = JCheckBox("Body", True)
+        self._param_cookie = JCheckBox("Cookie", True)
+        self._param_json = JCheckBox("JSON", True)
+        self._param_xml = JCheckBox("XML", True)
+        self._param_multipart = JCheckBox("Multipart", True)
+
+        self._param_url.setToolTipText("Strip URL query parameters")
+        self._param_body.setToolTipText("Strip body/form parameters")
+        self._param_cookie.setToolTipText("Strip cookie parameters")
+        self._param_json.setToolTipText("Strip JSON body parameters")
+        self._param_xml.setToolTipText("Strip XML and XML attribute parameters")
+        self._param_multipart.setToolTipText("Strip multipart attribute parameters")
+
+        opts.add(JLabel("Param Types:"))
+        opts.add(self._param_url)
+        opts.add(self._param_body)
+        opts.add(self._param_cookie)
+        opts.add(self._param_json)
+        opts.add(self._param_xml)
+        opts.add(self._param_multipart)
+
+        # Separator
+        opts.add(JLabel("   "))
+
+        # Matching options
+        self._param_case_sensitive = JCheckBox("Case-sensitive", False)
+        self._param_regex_mode = JCheckBox("Regex mode", False)
+        self._param_partial_match = JCheckBox("Partial match", False)
+
+        self._param_case_sensitive.setToolTipText(
+            "Match parameter names exactly (case-sensitive)"
+        )
+        self._param_regex_mode.setToolTipText(
+            "Treat each entry as a regular expression pattern"
+        )
+        self._param_partial_match.setToolTipText(
+            "Match if the parameter name contains the pattern as a substring"
+        )
+
+        opts.add(JLabel("Matching:"))
+        opts.add(self._param_case_sensitive)
+        opts.add(self._param_regex_mode)
+        opts.add(self._param_partial_match)
+
+        # Separator
+        opts.add(JLabel("   "))
+
+        # Import/Export buttons
+        import_btn = JButton("Import")
+        export_btn = JButton("Export")
+        import_btn.setToolTipText("Import parameter list from a text file")
+        export_btn.setToolTipText("Export parameter list to a text file")
+        import_btn.addActionListener(ImportListener(self, "param"))
+        export_btn.addActionListener(ExportListener(self, "param"))
+        opts.add(import_btn)
+        opts.add(export_btn)
+
+        panel.add(opts, BorderLayout.SOUTH)
+        return panel
+
+    def _build_control_panel(self):
+        """Build the control panel with tool checkboxes and start/stop buttons."""
+        panel = JPanel(BorderLayout(5, 5))
+
+        # Tool checkboxes panel
+        tool_panel = JPanel(FlowLayout(FlowLayout.LEFT, 6, 2))
+        tool_panel.setBorder(CompoundBorder(
+            TitledBorder(EtchedBorder(),
+                         "Active Tools (select which Burp tools to apply stripping to)"),
+            EmptyBorder(5, 5, 5, 5)
+        ))
+
+        self._tool_checkboxes = {}
+        for tool_flag, tool_name in TOOL_MAP_ORDERED:
+            if "Proxy" in tool_name:
+                cb = JCheckBox(tool_name, False)
+                cb.setToolTipText(
+                    "CAUTION: Modifying proxy traffic may break normal browsing. "
+                    "Enable only when you understand the implications."
+                )
+            else:
+                cb = JCheckBox(tool_name, True)
+                cb.setToolTipText(
+                    "Apply stripping to %s requests" % tool_name
+                )
+            self._tool_checkboxes[tool_flag] = cb
+            tool_panel.add(cb)
+
+        # Select All / Deselect All buttons
+        select_all_btn = JButton("Select All")
+        deselect_all_btn = JButton("Deselect All")
+        select_all_btn.setToolTipText("Check all tool checkboxes")
+        deselect_all_btn.setToolTipText("Uncheck all tool checkboxes")
+        select_all_btn.addActionListener(SelectAllToolsListener(self, True))
+        deselect_all_btn.addActionListener(SelectAllToolsListener(self, False))
+        tool_panel.add(select_all_btn)
+        tool_panel.add(deselect_all_btn)
+
+        panel.add(tool_panel, BorderLayout.CENTER)
+
+        # Start/Stop + Status panel
+        button_panel = JPanel(FlowLayout(FlowLayout.RIGHT, 6, 2))
+        button_panel.setBorder(EmptyBorder(5, 5, 5, 5))
+
+        self._start_btn = JButton("Start")
+        self._stop_btn = JButton("Stop")
+        self._stop_btn.setEnabled(False)
+        self._clear_log_btn = JButton("Clear Log")
+
+        self._start_btn.setToolTipText("Start request modification")
+        self._stop_btn.setToolTipText("Stop request modification")
+        self._clear_log_btn.setToolTipText("Clear the activity log")
+
+        self._status_label = JLabel("STOPPED")
+        self._status_label.setFont(Font("SansSerif", Font.BOLD, 13))
+        self._status_label.setForeground(Color(204, 0, 0))  # Dark red
+
+        self._start_btn.addActionListener(StartListener(self))
+        self._stop_btn.addActionListener(StopListener(self))
+        self._clear_log_btn.addActionListener(ClearLogListener(self))
+
+        button_panel.add(self._clear_log_btn)
+        button_panel.add(self._start_btn)
+        button_panel.add(self._stop_btn)
+        button_panel.add(JLabel("  Status: "))
+        button_panel.add(self._status_label)
+
+        panel.add(button_panel, BorderLayout.EAST)
+        return panel
+
+    def _build_stats_panel(self):
+        """Build the statistics display panel."""
+        panel = JPanel(FlowLayout(FlowLayout.LEFT, 15, 2))
+        panel.setBorder(CompoundBorder(
+            TitledBorder(EtchedBorder(), "Statistics"),
+            EmptyBorder(3, 5, 3, 5)
+        ))
+
+        self._stats_label = JLabel(
+            "Headers removed: 0 | Parameters removed: 0 | Requests processed: 0"
+        )
+        self._stats_label.setFont(Font("SansSerif", Font.PLAIN, 12))
+        panel.add(self._stats_label)
+
+        reset_stats_btn = JButton("Reset Stats")
+        reset_stats_btn.setToolTipText("Reset all statistics counters to zero")
+        reset_stats_btn.addActionListener(ResetStatsListener(self))
+        panel.add(reset_stats_btn)
+
+        return panel
+
+    def _build_log_panel(self):
+        """Build the activity log panel."""
+        panel = JPanel(BorderLayout(5, 5))
+        panel.setPreferredSize(Dimension(800, 140))
+        panel.setBorder(CompoundBorder(
+            TitledBorder(EtchedBorder(), "Activity Log"),
+            EmptyBorder(5, 5, 5, 5)
+        ))
+
+        self._log_text = JTextArea(5, 30)
+        self._log_text.setFont(Font("Monospaced", Font.PLAIN, 11))
+        self._log_text.setEditable(False)
+        scroll = JScrollPane(self._log_text)
+        panel.add(scroll, BorderLayout.CENTER)
+
+        return panel
+
+    # ============================================================
+    # Extension Start / Stop
+    # ============================================================
+
+    def _start_extension(self):
+        """Start the extension - begin processing requests."""
+        with self._lock:
+            self._is_running = True
+        SwingUtilities.invokeLater(SetStatusRunnable(self, True))
+
+    def _stop_extension(self):
+        """Stop the extension - stop processing requests."""
+        with self._lock:
+            self._is_running = False
+        SwingUtilities.invokeLater(SetStatusRunnable(self, False))
+
+    def _is_running_safe(self):
+        """Thread-safe check if the extension is currently running."""
+        with self._lock:
+            return self._is_running
+
+    def _get_active_tools(self):
+        """Get the set of currently active tool flags from checkboxes."""
+        active = set()
+        for tool_flag, cb in self._tool_checkboxes.items():
+            if cb.isSelected():
+                active.add(tool_flag)
+        return active
+
+    # ============================================================
+    # IHttpListener Implementation
+    # ============================================================
 
     def processHttpMessage(self, toolFlag, messageIsRequest, messageInfo):
-        if not self._running:
-            return
-        try:
-            if not self._should_process(toolFlag):
-                return
-            if messageIsRequest:
-                self._process_request(messageInfo)
-            else:
-                self._process_response(messageInfo)
-        except Exception as e:
-            self._log("processHttpMessage error: %s" % str(e))
-
-    # ------------------------------------------------------------------
-    # Request / Response processing
-    # ------------------------------------------------------------------
-
-    def _should_process(self, toolFlag):
-        mapping = {
-            self.TOOL_PROXY:     self._chk_proxy,
-            self.TOOL_REPEATER:  self._chk_repeater,
-            self.TOOL_INTRUDER:  self._chk_intruder,
-            self.TOOL_SCANNER:   self._chk_scanner,
-            self.TOOL_SEQUENCER: self._chk_sequencer,
-            self.TOOL_EXTENDER:  self._chk_extensions,
-            self.TOOL_TARGET:    self._chk_target,
-        }
-        chk = mapping.get(toolFlag)
-        return chk is not None and chk.isSelected()
-
-    def _process_request(self, messageInfo):
         """
-        Two-phase request modification:
-          Phase 1 (ALL domains in tool scope): Remove global headers
-          Phase 2 (main domain only): Remove domain-specific headers,
-                  replace JSESSIONID/INGRESSCOOKIE in Cookie header,
-                  add Authorization: Bearer <jwt>
+        Called by Burp for each HTTP message passing through any tool.
+
+        Only processes requests (not responses), only when extension is running,
+        and only for tools whose checkboxes are checked.
         """
-        http_service = messageInfo.getHttpService()
-        if http_service is None:
+        # Only process requests, not responses
+        if not messageIsRequest:
             return
 
+        # Check if extension is running
+        if not self._is_running_safe():
+            return
+
+        # Check if this tool is in the active set
+        if toolFlag not in self._get_active_tools():
+            return
+
+        # Get the request bytes
         request = messageInfo.getRequest()
         if request is None:
             return
 
-        request_info = self._helpers.analyzeRequest(messageInfo)
-        headers = list(request_info.getHeaders())
-        body = request[request_info.getBodyOffset():]
-
-        host = http_service.getHost()
-        main_domain = self._txt_main_domain.getText().strip()
-        is_main = (main_domain != "" and host == main_domain)
-
-        modified = False
-
-        # --- Phase 1: Global header removal (ALL domains) ---
-        global_remove = self._get_global_headers_to_remove()
-        if global_remove:
-            headers, changed = self._strip_headers(headers, global_remove)
-            if changed:
-                modified = True
-
-        # --- Phase 2: Main-domain-only modifications ---
-        if is_main:
-            # 2a. Remove domain-specific headers
-            domain_remove = self._get_domain_headers_to_remove()
-            if domain_remove:
-                headers, changed = self._strip_headers(headers, domain_remove)
-                if changed:
-                    modified = True
-
-            # 2b. Replace JSESSIONID in Cookie header
-            if self._jsessionid:
-                headers, changed = self._replace_cookie_value(
-                    headers, "JSESSIONID", self._jsessionid)
-                if changed:
-                    modified = True
-
-            # 2c. Replace INGRESSCOOKIE in Cookie header
-            if self._ingresscookie:
-                headers, changed = self._replace_cookie_value(
-                    headers, "INGRESSCOOKIE", self._ingresscookie)
-                if changed:
-                    modified = True
-
-            # 2d. Add / replace Authorization header
-            token = self._get_cached_token()
-            if token:
-                headers, changed = self._set_auth_header(headers, token)
-                if changed:
-                    modified = True
-
-        if modified:
-            new_request = self._helpers.buildHttpMessage(headers, body)
-            messageInfo.setRequest(new_request)
-
-    def _process_response(self, messageInfo):
-        """Watch for 401 from the protected domain -> invalidate cache."""
-        response = messageInfo.getResponse()
-        if response is None:
-            return
-
-        http_service = messageInfo.getHttpService()
-        if http_service is None:
-            return
-
-        host = http_service.getHost()
-        main_domain = self._txt_main_domain.getText().strip()
-        if not main_domain or host != main_domain:
-            return
-
-        response_info = self._helpers.analyzeResponse(response)
-        if response_info.getStatusCode() == 401:
-            self._log("401 detected from %s - invalidating token" % host)
-            self._invalidate_token()
-
-    # ------------------------------------------------------------------
-    # Token management
-    # ------------------------------------------------------------------
-
-    def _get_cached_token(self):
-        with self._token_lock:
-            if self._token_cache and self._is_token_valid():
-                return self._token_cache
-            if self._token_cache is None and \
-               (time.time() - self._last_refresh_attempt) < self.REFRESH_COOLDOWN:
-                return None
-            self._do_refresh()
-            return self._token_cache
-
-    def _is_token_valid(self):
-        if not self._token_cache:
-            return False
-        return time.time() < (self._token_expiry - self.TOKEN_BUFFER)
-
-    def _invalidate_token(self):
-        with self._token_lock:
-            self._token_cache  = None
-            self._token_expiry = 0
-            self._jsessionid   = None
-            self._ingresscookie = None
-        self._update_token_info("Token: INVALIDATED")
-
-    def _do_refresh(self):
-        """Must be called while holding _token_lock."""
-        if self._refreshing:
-            return
-        self._refreshing = True
-        self._last_refresh_attempt = time.time()
         try:
-            self._edt_status("Refreshing token...")
-            token = self._execute_token_flow()
-            if token:
-                self._token_cache  = token
-                self._token_expiry = self._decode_jwt_expiry(token)
-                self._refresh_count += 1
-                exp_str = time.strftime("%H:%M:%S", time.localtime(self._token_expiry))
-                iat = self._decode_jwt_field(token, "iat")
-                iat_str = time.strftime("%H:%M:%S", time.localtime(iat)) if iat else "?"
-                self._log("Token refreshed (#%d). Issued: %s | Expires: %s" % (
-                    self._refresh_count, iat_str, exp_str))
-                self._edt_status("Running - Token valid until %s" % exp_str)
-                if len(token) > 35:
-                    preview = token[:20] + "..." + token[-12:]
+            modified = False
+            modified_request = request
+
+            # ---- Strip Headers ----
+            header_patterns = self._get_header_patterns()
+            if header_patterns:
+                modified_request, removed_headers = self._strip_headers(
+                    modified_request, header_patterns
+                )
+                if removed_headers:
+                    modified = True
+                    with self._stats_lock:
+                        self._stats_headers_removed += len(removed_headers)
+                    tool_name = self._get_tool_name(toolFlag)
+                    for h in removed_headers:
+                        self._add_log("HEADER", "[%s] Removed: %s" % (tool_name, h))
+
+            # ---- Strip Parameters ----
+            param_patterns = self._get_param_patterns()
+            if param_patterns:
+                modified_request, removed_params = self._strip_parameters(
+                    modified_request, param_patterns
+                )
+                if removed_params:
+                    modified = True
+                    with self._stats_lock:
+                        self._stats_params_removed += len(removed_params)
+                    tool_name = self._get_tool_name(toolFlag)
+                    for p in removed_params:
+                        self._add_log("PARAM", "[%s] Removed: %s" % (tool_name, p))
+
+            # Update the request if any modifications were made
+            if modified:
+                messageInfo.setRequest(modified_request)
+                with self._stats_lock:
+                    self._stats_requests_processed += 1
+                SwingUtilities.invokeLater(UpdateStatsRunnable(self))
+
+        except Exception as e:
+            self._add_log("ERROR", "processHttpMessage: %s" % str(e))
+
+    # ============================================================
+    # Header Stripping Logic
+    # ============================================================
+
+    def _get_header_patterns(self):
+        """Parse the header text area and return list of header patterns."""
+        return parse_text_entries(self._header_text.getText(), is_header=True)
+
+    def _get_param_patterns(self):
+        """Parse the parameter text area and return list of parameter patterns."""
+        return parse_text_entries(self._param_text.getText(), is_header=False)
+
+    def _strip_headers(self, request, header_patterns):
+        """
+        Remove matching headers from an HTTP request.
+
+        Args:
+            request: The raw request bytes (Java byte[])
+            header_patterns: List of header name patterns to match
+
+        Returns:
+            Tuple of (modified_request_bytes, list_of_removed_header_strings)
+            If no headers were removed, returns (original_request, [])
+        """
+        try:
+            request_info = self._helpers.analyzeRequest(request)
+
+            # CRITICAL: Convert Java List to Python list for safe indexing/slicing
+            # Java Lists in Jython do NOT support Python-style slicing ([1:])
+            original_headers = [h for h in request_info.getHeaders()]
+
+            body_offset = request_info.getBodyOffset()
+            body = request[body_offset:]
+
+            if len(original_headers) == 0:
+                return request, []
+
+            # Read matching options from UI
+            case_sensitive = self._header_case_sensitive.isSelected()
+            regex_mode = self._header_regex_mode.isSelected()
+            partial_match = self._header_partial_match.isSelected()
+
+            # First header line is always the request line
+            # (e.g., "GET /path HTTP/1.1") - must NEVER be removed
+            request_line = original_headers[0]
+            new_headers = [request_line]
+            removed = []
+
+            for header in original_headers[1:]:
+                colon_idx = header.find(":")
+                if colon_idx == -1:
+                    # Malformed header without colon - keep as-is for safety
+                    new_headers.append(header)
+                    continue
+
+                header_name = header[:colon_idx].strip()
+
+                if should_match(header_name, header_patterns,
+                                case_sensitive, regex_mode, partial_match):
+                    removed.append(header)
                 else:
-                    preview = token[:15] + "..."
-                self._update_token_info("Token: %s" % preview)
+                    new_headers.append(header)
+
+            if removed:
+                modified_request = self._helpers.buildHttpMessage(new_headers, body)
+                return modified_request, removed
             else:
-                self._log("Token refresh FAILED. Check config / cookies.")
-                self._edt_status("Refresh FAILED - check log")
-                self._update_token_info("Token: NONE (refresh failed)")
-        except Exception as e:
-            self._log("Token refresh exception: %s" % str(e))
-            self._edt_status("Refresh ERROR - check log")
-        finally:
-            self._refreshing = False
-
-    # ------------------------------------------------------------------
-    # 3-step OAuth2 flow
-    # ------------------------------------------------------------------
-
-    def _execute_token_flow(self):
-        sso_domain   = self._txt_sso_domain.getText().strip()
-        main_domain  = self._txt_main_domain.getText().strip()
-        client_id    = self._txt_client_id.getText().strip()
-        redirect_uri = self._txt_redirect_uri.getText().strip()
-        scope        = self._txt_scope.getText().strip()
-        sso_path     = self._txt_sso_path.getText().strip()
-        base_path    = self._txt_base_path.getText().strip()
-        sso_cookies  = self._txt_sso_cookies.getText().strip().replace("\n", " ").replace("\r", "")
-
-        if not sso_domain or not main_domain or not client_id or not redirect_uri or not sso_cookies:
-            self._log("Missing required config: SSO Domain, Main Domain, Client ID, Redirect URI, and SSO Cookies are all required.")
-            return None
-
-        redirect_url = self._step1_authorize(
-            sso_domain, sso_path, client_id, redirect_uri, scope, sso_cookies)
-        if not redirect_url:
-            return None
-
-        jsessionid, ingresscookie = self._step2_exchange_code(redirect_url, main_domain)
-        if not jsessionid:
-            return None
-        self._jsessionid = jsessionid
-        if ingresscookie:
-            self._ingresscookie = ingresscookie
-
-        token, ingresscookie2 = self._step3_get_token(main_domain, base_path, jsessionid)
-        if not token:
-            return None
-        # Step 3 may return an updated INGRESSCOOKIE
-        if ingresscookie2:
-            self._ingresscookie = ingresscookie2
-
-        self._log("Cached: JSESSIONID=%s... | INGRESSCOOKIE=%s" % (
-            jsessionid[:12] if jsessionid else "None",
-            ingresscookie2[:12] if ingresscookie2 else (ingresscookie[:12] if ingresscookie else "None")))
-        return token
-
-    # -- Step 1 ---------------------------------------------------------
-
-    def _step1_authorize(self, sso_domain, sso_path, client_id, redirect_uri, scope, sso_cookies):
-        try:
-            nonce_raw = str(int(time.time() * 1000))
-            nonce     = base64.b64encode(nonce_raw).replace("\n", "").replace("\r", "")
-
-            scope_enc    = URLEncoder.encode(scope, "UTF-8")
-            redirect_enc = URLEncoder.encode(redirect_uri, "UTF-8")
-            nonce_enc    = URLEncoder.encode(nonce, "UTF-8")
-
-            path = "%s?scope=%s&response_type=code&redirect_uri=%s&nonce=%s&client_id=%s" % (
-                sso_path, scope_enc, redirect_enc, nonce_enc, client_id)
-
-            host, port = self._parse_host_port(sso_domain)
-            proto = "https" if port == 443 else "http"
-
-            req = (
-                "GET %s HTTP/1.1\r\n"
-                "Host: %s\r\n"
-                "Connection: close\r\n"
-                "Cookie: %s\r\n"
-                "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36\r\n"
-                "Accept: */*\r\n"
-                "Accept-Encoding: identity\r\n"
-                "Referer: https://%s/\r\n"
-                "\r\n"
-            ) % (path, host, sso_cookies, host)
-
-            http_svc = self._helpers.buildHttpService(host, port, proto)
-            req_bytes = self._helpers.stringToBytes(req)
-
-            self._log("[Step 1] Authorize -> %s%s" % (host, sso_path))
-            resp = self._callbacks.makeHttpRequest(http_svc, req_bytes)
-
-            if resp is None:
-                self._log("[Step 1] No response from SSO server")
-                return None
-
-            ri = self._helpers.analyzeResponse(resp)
-            sc = ri.getStatusCode()
-
-            if sc != 302:
-                self._log("[Step 1] Expected 302, got %d. SSO cookies may be expired." % sc)
-                body = resp[ri.getBodyOffset():]
-                if body:
-                    self._log("[Step 1] Body preview: %s" % self._helpers.bytesToString(body)[:300])
-                return None
-
-            location = None
-            for h in ri.getHeaders():
-                if h.lower().startswith("location:"):
-                    location = h.split(":", 1)[1].strip()
-                    break
-
-            if not location:
-                self._log("[Step 1] 302 without Location header")
-                return None
-
-            if "code=" not in location:
-                self._log("[Step 1] Location has no 'code' param: %s" % location[:200])
-                return None
-
-            self._log("[Step 1] Got redirect URL (%d chars)" % len(location))
-            return location
+                return request, []
 
         except Exception as e:
-            self._log("[Step 1] Exception: %s" % str(e))
-            return None
+            self._add_log("ERROR", "_strip_headers: %s" % str(e))
+            return request, []
 
-    # -- Step 2 ---------------------------------------------------------
+    # ============================================================
+    # Parameter Stripping Logic
+    # ============================================================
 
-    def _step2_exchange_code(self, redirect_url, fallback_domain):
-        """Returns (jsessionid, ingresscookie) or (None, None)."""
+    def _strip_parameters(self, request, param_patterns):
+        """
+        Remove matching parameters from an HTTP request.
+
+        Args:
+            request: The raw request bytes (Java byte[])
+            param_patterns: List of parameter name patterns to match
+
+        Returns:
+            Tuple of (modified_request_bytes, list_of_removed_param_strings)
+            If no parameters were removed, returns (original_request, [])
+        """
         try:
-            url = URL(redirect_url)
-            host = url.getHost()
-            port = url.getPort()
-            proto = url.getProtocol() or "https"
-            if port == -1:
-                port = 443 if proto == "https" else 80
+            # Read matching options from UI
+            case_sensitive = self._param_case_sensitive.isSelected()
+            regex_mode = self._param_regex_mode.isSelected()
+            partial_match = self._param_partial_match.isSelected()
 
-            path  = url.getPath() or "/"
-            query = url.getQuery()
-            if query:
-                req_path = "%s?%s" % (path, query)
+            # Build set of parameter types to strip based on checkboxes
+            strip_types = set()
+            if self._param_url.isSelected():
+                strip_types.add(PARAM_URL)
+            if self._param_body.isSelected():
+                strip_types.add(PARAM_BODY)
+            if self._param_cookie.isSelected():
+                strip_types.add(PARAM_COOKIE)
+            if self._param_json.isSelected():
+                strip_types.add(PARAM_JSON)
+            if self._param_xml.isSelected():
+                strip_types.add(PARAM_XML)
+                strip_types.add(PARAM_XML_ATTR)
+            if self._param_multipart.isSelected():
+                strip_types.add(PARAM_MULTIPART_ATTR)
+
+            if not strip_types:
+                return request, []
+
+            # CRITICAL: Convert Java List to Python list for safe iteration
+            request_info = self._helpers.analyzeRequest(request)
+            parameters = [p for p in request_info.getParameters()]
+
+            if not parameters:
+                return request, []
+
+            # Find parameters that should be removed
+            params_to_remove = []
+            removed_names = []
+
+            for param in parameters:
+                param_name = param.getName()
+                param_type = param.getType()
+
+                # Check if this parameter type is in the strip set
+                if param_type not in strip_types:
+                    continue
+
+                if should_match(param_name, param_patterns,
+                                case_sensitive, regex_mode, partial_match):
+                    params_to_remove.append(param)
+                    type_name = PARAM_TYPE_NAMES.get(param_type,
+                                                      "Type%d" % param_type)
+                    removed_names.append("%s [%s]" % (param_name, type_name))
+
+            # Remove parameters one by one
+            # Each removeParameter call returns a new request with that param removed
+            # This is safe because removeParameter matches by name+type, not position
+            modified_request = request
+            for param in params_to_remove:
+                try:
+                    modified_request = self._helpers.removeParameter(
+                        modified_request, param
+                    )
+                except Exception as e:
+                    self._add_log(
+                        "ERROR",
+                        "Failed to remove param '%s': %s" % (param.getName(), str(e))
+                    )
+
+            if removed_names:
+                return modified_request, removed_names
             else:
-                req_path = path
-
-            sso_host = self._txt_sso_domain.getText().strip().split(":")[0]
-
-            req = (
-                "GET %s HTTP/1.1\r\n"
-                "Host: %s\r\n"
-                "Connection: close\r\n"
-                "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36\r\n"
-                "Accept: text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8\r\n"
-                "Accept-Language: en-US\r\n"
-                "Accept-Encoding: identity\r\n"
-                "Referer: https://%s/\r\n"
-                "\r\n"
-            ) % (req_path, host, sso_host)
-
-            http_svc = self._helpers.buildHttpService(host, port, proto)
-            req_bytes = self._helpers.stringToBytes(req)
-
-            self._log("[Step 2] Exchange code -> %s%s" % (host, path))
-            resp = self._callbacks.makeHttpRequest(http_svc, req_bytes)
-
-            if resp is None:
-                self._log("[Step 2] No response from main server")
-                return None, None
-
-            ri = self._helpers.analyzeResponse(resp)
-            sc = ri.getStatusCode()
-
-            if sc != 200:
-                self._log("[Step 2] Expected 200, got %d" % sc)
-                return None, None
-
-            jsessionid = None
-            ingresscookie = None
-            for h in ri.getHeaders():
-                h_lower = h.lower()
-                if h_lower.startswith("set-cookie:"):
-                    cookie_val = h.split(":", 1)[1].strip()
-                    if "jsessionid" in h_lower:
-                        m = re.search(r'JSESSIONID=([^;\s]+)', cookie_val, re.IGNORECASE)
-                        if m:
-                            jsessionid = m.group(1)
-                    elif "ingresscookie" in h_lower:
-                        m = re.search(r'INGRESSCOOKIE=([^;\s]+)', cookie_val, re.IGNORECASE)
-                        if m:
-                            ingresscookie = m.group(1)
-
-            if not jsessionid:
-                self._log("[Step 2] No JSESSIONID in Set-Cookie headers")
-                return None, None
-
-            self._log("[Step 2] JSESSIONID: %s... | INGRESSCOOKIE: %s" % (
-                jsessionid[:15], ingresscookie[:15] if ingresscookie else "none"))
-            return jsessionid, ingresscookie
+                return request, []
 
         except Exception as e:
-            self._log("[Step 2] Exception: %s" % str(e))
-            return None, None
+            self._add_log("ERROR", "_strip_parameters: %s" % str(e))
+            return request, []
 
-    # -- Step 3 ---------------------------------------------------------
+    # ============================================================
+    # ITab Implementation
+    # ============================================================
 
-    def _step3_get_token(self, main_domain, base_path, jsessionid):
-        """Returns (token, ingresscookie) or (None, None)."""
-        try:
-            host, port = self._parse_host_port(main_domain)
-            proto = "https" if port == 443 else "http"
-            path  = "%s/token" % base_path
+    def getTabCaption(self):
+        """Return the tab title displayed in Burp's UI."""
+        return "H&P Stripper"
 
-            req = (
-                "GET %s HTTP/1.1\r\n"
-                "Host: %s\r\n"
-                "Connection: close\r\n"
-                "Cookie: JSESSIONID=%s\r\n"
-                "Accept: application/json, text/plain, */*\r\n"
-                "Accept-Language: en-US\r\n"
-                "Accept-Encoding: identity\r\n"
-                "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36\r\n"
-                "\r\n"
-            ) % (path, host, jsessionid)
+    def getUiComponent(self):
+        """Return the root UI component for this tab."""
+        return self._panel
 
-            http_svc = self._helpers.buildHttpService(host, port, proto)
-            req_bytes = self._helpers.stringToBytes(req)
+    # ============================================================
+    # IExtensionStateListener Implementation
+    # ============================================================
 
-            self._log("[Step 3] Fetch token -> %s%s" % (host, path))
-            resp = self._callbacks.makeHttpRequest(http_svc, req_bytes)
+    def extensionUnloaded(self):
+        """Called when the extension is unloaded by the user."""
+        self._stop_extension()
+        self._add_log("INFO", "Extension unloaded")
 
-            if resp is None:
-                self._log("[Step 3] No response from token endpoint")
-                return None, None
+    # ============================================================
+    # Utility Methods
+    # ============================================================
 
-            ri = self._helpers.analyzeResponse(resp)
-            sc = ri.getStatusCode()
+    def _get_tool_name(self, tool_flag):
+        """Get the display name for a tool flag constant."""
+        for tf, name in TOOL_MAP_ORDERED:
+            if tf == tool_flag:
+                return name
+        return "Tool(%d)" % tool_flag
 
-            if sc != 200:
-                self._log("[Step 3] Expected 200, got %d" % sc)
-                return None, None
+    # ============================================================
+    # Logging
+    # ============================================================
 
-            # Capture INGRESSCOOKIE from Step 3 response (may be updated)
-            ingresscookie = None
-            for h in ri.getHeaders():
-                h_lower = h.lower()
-                if h_lower.startswith("set-cookie:") and "ingresscookie" in h_lower:
-                    cookie_val = h.split(":", 1)[1].strip()
-                    m = re.search(r'INGRESSCOOKIE=([^;\s]+)', cookie_val, re.IGNORECASE)
-                    if m:
-                        ingresscookie = m.group(1)
-
-            body = resp[ri.getBodyOffset():]
-            body_str = self._helpers.bytesToString(body)
-
-            try:
-                data = json.loads(body_str)
-            except ValueError:
-                self._log("[Step 3] Response is not valid JSON: %s" % body_str[:200])
-                return None, None
-
-            token = data.get("token") or data.get("access_token") or data.get("id_token")
-            if not token:
-                self._log("[Step 3] No token field in JSON: %s" % body_str[:200])
-                return None, None
-
-            self._log("[Step 3] Token obtained (%d chars)" % len(token))
-            return token, ingresscookie
-
-        except Exception as e:
-            self._log("[Step 3] Exception: %s" % str(e))
-            return None, None
-
-    # ------------------------------------------------------------------
-    # JWT helpers
-    # ------------------------------------------------------------------
-
-    def _decode_jwt_expiry(self, token):
-        try:
-            parts = token.split(".")
-            if len(parts) < 2:
-                return int(time.time()) + 3600
-            payload_b64 = parts[1]
-            pad = 4 - len(payload_b64) % 4
-            if pad != 4:
-                payload_b64 += "=" * pad
-            payload_bytes = base64.urlsafe_b64decode(payload_b64)
-            payload = json.loads(payload_bytes)
-            exp = payload.get("exp", 0)
-            if exp:
-                return int(exp)
-            return int(time.time()) + 3600
-        except Exception as e:
-            self._log("JWT decode error (using 1h default): %s" % str(e))
-            return int(time.time()) + 3600
-
-    def _decode_jwt_field(self, token, field):
-        try:
-            parts = token.split(".")
-            if len(parts) < 2:
-                return None
-            payload_b64 = parts[1]
-            pad = 4 - len(payload_b64) % 4
-            if pad != 4:
-                payload_b64 += "=" * pad
-            payload = json.loads(base64.urlsafe_b64decode(payload_b64))
-            return payload.get(field)
-        except Exception:
-            return None
-
-    # ------------------------------------------------------------------
-    # Header & Cookie manipulation
-    # ------------------------------------------------------------------
-
-    def _strip_headers(self, headers, names_to_remove):
+    def _add_log(self, level, message):
         """
-        Remove headers whose name matches any in names_to_remove.
-        Returns (new_headers, changed).
+        Add a log entry. Thread-safe. Updates UI on Swing EDT.
+
+        Args:
+            level: Log level string (INFO, HEADER, PARAM, ERROR)
+            message: Log message string
         """
-        names_lower = [n.lower() for n in names_to_remove]
-        result = []
-        changed = False
-        for h in headers:
-            if ":" not in h:
-                result.append(h)
-                continue
-            name = h.split(":", 1)[0].strip().lower()
-            if name in names_lower:
-                changed = True
-            else:
-                result.append(h)
-        return result, changed
+        timestamp = time.strftime("%H:%M:%S")
+        entry = "[%s] [%s] %s" % (timestamp, level, message)
 
-    def _replace_cookie_value(self, headers, cookie_name, cookie_value):
-        """
-        Replace an EXISTING cookie value in the Cookie header.
-        ONLY replaces if the cookie already exists in the request.
-        NEVER forcefully adds a cookie that wasn't there - this is critical
-        because injecting JSESSIONID into session-flow requests (like the
-        code exchange) would prevent the server from issuing a new one.
-        Returns (new_headers, changed).
-        """
-        result = []
-        found_cookie_header = False
-        changed = False
+        with self._log_lock:
+            self._log_entries.append(entry)
+            # Keep only last 1000 entries to prevent unbounded memory growth
+            if len(self._log_entries) > 1000:
+                self._log_entries = self._log_entries[-500:]
 
-        for h in headers:
-            if ":" not in h:
-                result.append(h)
-                continue
-            name = h.split(":", 1)[0].strip().lower()
-            if name == "cookie":
-                found_cookie_header = True
-                cookie_str = h.split(":", 1)[1].strip()
-                new_cookie_str, did_replace = self._replace_cookie_in_string(
-                    cookie_str, cookie_name, cookie_value)
-                if did_replace:
-                    changed = True
-                result.append("Cookie: %s" % new_cookie_str)
-            else:
-                result.append(h)
+        SwingUtilities.invokeLater(AppendLogRunnable(self, entry))
 
-        # Do NOT add a new Cookie header if none existed.
-        # Do NOT append the cookie if it wasn't already present.
-        # Only replace what was already there.
+    # ============================================================
+    # Statistics
+    # ============================================================
 
-        return result, changed
-
-    def _replace_cookie_in_string(self, cookie_str, cookie_name, cookie_value):
-        """
-        Parse a Cookie header value string, replace cookie_name if it exists.
-        If cookie_name is NOT found, returns the string unchanged.
-        Preserves all other cookies intact.
-        Returns (new_cookie_string, was_replaced).
-        """
-        cookies = []
-        found = False
-        for part in cookie_str.split(";"):
-            part = part.strip()
-            if not part:
-                continue
-            if "=" in part:
-                cname = part.split("=", 1)[0].strip()
-                cval  = part.split("=", 1)[1].strip()
-                if cname.lower() == cookie_name.lower():
-                    cookies.append("%s=%s" % (cookie_name, cookie_value))
-                    found = True
-                else:
-                    cookies.append("%s=%s" % (cname, cval))
-            else:
-                cookies.append(part)
-
-        # If the cookie was not found, do NOT add it.
-        # Return the original string unchanged.
-        if not found:
-            return cookie_str, False
-
-        return "; ".join(cookies), True
-
-    def _set_auth_header(self, headers, token):
-        """Add or replace the Authorization: Bearer header. Returns (new_headers, changed)."""
-        result = []
-        replaced = False
-        changed = False
-        for h in headers:
-            if ":" not in h:
-                result.append(h)
-                continue
-            name = h.split(":", 1)[0].strip().lower()
-            if name == "authorization":
-                new_header = "Authorization: Bearer %s" % token
-                if h != new_header:
-                    changed = True
-                result.append(new_header)
-                replaced = True
-            else:
-                result.append(h)
-        if not replaced:
-            result.append("Authorization: Bearer %s" % token)
-            changed = True
-        return result, changed
-
-    def _get_global_headers_to_remove(self):
-        text = self._txt_headers_remove_global.getText().strip()
-        if not text:
-            return []
-        return [line.strip() for line in text.split("\n") if line.strip()]
-
-    def _get_domain_headers_to_remove(self):
-        text = self._txt_headers_remove_domain.getText().strip()
-        if not text:
-            return []
-        return [line.strip() for line in text.split("\n") if line.strip()]
-
-    # ------------------------------------------------------------------
-    # Utility
-    # ------------------------------------------------------------------
-
-    def _parse_host_port(self, domain):
-        domain = domain.strip()
-        if ":" in domain:
-            parts = domain.rsplit(":", 1)
-            try:
-                return parts[0], int(parts[1])
-            except ValueError:
-                return parts[0], 443
-        return domain, 443
-
-    # ------------------------------------------------------------------
-    # Swing UI
-    # ------------------------------------------------------------------
-
-    def _build_ui(self):
-        self._main_panel = JPanel(BorderLayout(8, 8))
-        self._main_panel.setBorder(EmptyBorder(8, 8, 8, 8))
-
-        # Scrollable top section for config + controls
-        top_content = JPanel(BorderLayout(8, 8))
-        top_content.add(self._build_config_panel(), BorderLayout.CENTER)
-
-        mid_panel = JPanel(BorderLayout(8, 8))
-        mid_panel.add(self._build_scope_panel(), BorderLayout.WEST)
-        mid_panel.add(self._build_control_panel(), BorderLayout.CENTER)
-        top_content.add(mid_panel, BorderLayout.SOUTH)
-
-        top_scroll = JScrollPane(top_content)
-        top_scroll.setPreferredSize(Dimension(750, 420))
-        top_scroll.setBorder(None)
-
-        self._main_panel.add(top_scroll, BorderLayout.CENTER)
-        self._main_panel.add(self._build_log_panel(), BorderLayout.SOUTH)
-
-    # -- Configuration panel --------------------------------------------
-
-    def _build_config_panel(self):
-        panel = JPanel(GridBagLayout())
-        gbc = GridBagConstraints()
-        gbc.fill = GridBagConstraints.HORIZONTAL
-        gbc.insets = Insets(2, 4, 2, 4)
-
-        row = [0]
-
-        def add_row(label_text, default, cols=35, is_area=False, area_rows=3):
-            gbc.gridx = 0; gbc.gridy = row[0]; gbc.weightx = 0
-            lbl = JLabel(label_text)
-            lbl.setHorizontalAlignment(JLabel.RIGHT)
-            panel.add(lbl, gbc)
-
-            gbc.gridx = 1; gbc.gridy = row[0]; gbc.weightx = 1; gbc.gridwidth = 3
-            if is_area:
-                comp = JTextArea(area_rows, cols)
-                comp.setLineWrap(True)
-                comp.setWrapStyleWord(True)
-                comp.setText(default)
-                sp = JScrollPane(comp)
-                sp.setPreferredSize(Dimension(450, area_rows * 20))
-                panel.add(sp, gbc)
-            else:
-                comp = JTextField(default, cols)
-                panel.add(comp, gbc)
-
-            gbc.gridwidth = 1
-            row[0] += 1
-            return comp
-
-        self._txt_sso_domain   = add_row("SSO Domain:", "sso.example.com")
-        self._txt_main_domain  = add_row("Main Domain:", "main.example.com")
-        self._txt_client_id    = add_row("Client ID:", "")
-        self._txt_redirect_uri = add_row("Redirect URI:", "https://main.example.com/transact-explorer-wa/")
-        self._txt_scope        = add_row("Scope:", "openid profile")
-        self._txt_sso_path     = add_row("SSO Auth Path:", "/sgconnect/oauth2/authorize")
-        self._txt_base_path    = add_row("App Base Path:", "/transact-explorer-wa")
-        self._txt_sso_cookies  = add_row("SSO Cookies:", "", is_area=True, area_rows=3)
-        self._txt_headers_remove_global = add_row(
-            "Headers to Remove\n(ALL requests):",
-            "",
-            is_area=True, area_rows=3
-        )
-        self._txt_headers_remove_domain = add_row(
-            "Headers to Remove\n(Main Domain only):",
-            "Sec-Fetch-Site\nSec-Fetch-Mode\nSec-Fetch-Dest\nsec-ch-ua\nsec-ch-ua-mobile\nsec-ch-ua-platform",
-            is_area=True, area_rows=5
+    def _update_stats_display(self):
+        """Update the statistics label (must be called on Swing EDT)."""
+        with self._stats_lock:
+            h = self._stats_headers_removed
+            p = self._stats_params_removed
+            r = self._stats_requests_processed
+        self._stats_label.setText(
+            "Headers removed: %d | Parameters removed: %d | Requests processed: %d"
+            % (h, p, r)
         )
 
-        panel.setBorder(TitledBorder(
-            BorderFactory.createEtchedBorder(EtchedBorder.LOWERED),
-            "  Configuration  "
-        ))
-        return panel
-
-    # -- Scope panel ----------------------------------------------------
-
-    def _build_scope_panel(self):
-        panel = JPanel(GridBagLayout())
-        gbc = GridBagConstraints()
-        gbc.anchor = GridBagConstraints.WEST
-        gbc.insets = Insets(1, 4, 1, 4)
-
-        self._chk_proxy      = JCheckBox("Proxy  (use with caution)", True)
-        self._chk_repeater   = JCheckBox("Repeater",  True)
-        self._chk_intruder   = JCheckBox("Intruder",  True)
-        self._chk_scanner    = JCheckBox("Scanner",   True)
-        self._chk_sequencer  = JCheckBox("Sequencer", False)
-        self._chk_extensions = JCheckBox("Extensions", False)
-        self._chk_target     = JCheckBox("Target",    False)
-
-        checkboxes = [
-            self._chk_proxy, self._chk_repeater, self._chk_intruder,
-            self._chk_scanner, self._chk_sequencer, self._chk_extensions,
-            self._chk_target
-        ]
-        for i, cb in enumerate(checkboxes):
-            gbc.gridx = 0; gbc.gridy = i
-            panel.add(cb, gbc)
-
-        panel.setBorder(TitledBorder(
-            BorderFactory.createEtchedBorder(EtchedBorder.LOWERED),
-            "  Tool Scope  "
-        ))
-        return panel
-
-    # -- Control panel --------------------------------------------------
-
-    def _build_control_panel(self):
-        panel = JPanel(GridBagLayout())
-        gbc = GridBagConstraints()
-        gbc.insets = Insets(4, 6, 4, 6)
-        gbc.fill = GridBagConstraints.HORIZONTAL
-
-        btn_panel = JPanel(FlowLayout(FlowLayout.LEFT, 6, 2))
-        self._btn_start   = JButton("Start",   actionPerformed=self._on_start)
-        self._btn_stop    = JButton("Stop",    actionPerformed=self._on_stop)
-        self._btn_refresh = JButton("Force Refresh", actionPerformed=self._on_force_refresh)
-        self._btn_clear   = JButton("Clear Log",     actionPerformed=self._on_clear_log)
-
-        self._btn_stop.setEnabled(False)
-        self._btn_refresh.setEnabled(False)
-
-        for b in [self._btn_start, self._btn_stop, self._btn_refresh, self._btn_clear]:
-            btn_panel.add(b)
-
-        self._lbl_status     = JLabel("Status: Stopped")
-        self._lbl_status.setFont(Font("Monospaced", Font.BOLD, 12))
-        self._lbl_token_info = JLabel("Token: NONE")
-        self._lbl_token_info.setFont(Font("Monospaced", Font.PLAIN, 11))
-        self._lbl_expiry     = JLabel("Expires: N/A")
-        self._lbl_expiry.setFont(Font("Monospaced", Font.PLAIN, 11))
-        self._lbl_refresh_ct = JLabel("Refreshes: 0")
-        self._lbl_refresh_ct.setFont(Font("Monospaced", Font.PLAIN, 11))
-        self._lbl_session    = JLabel("JSESSIONID: N/A | INGRESSCOOKIE: N/A")
-        self._lbl_session.setFont(Font("Monospaced", Font.PLAIN, 11))
-
-        info_panel = JPanel(GridBagLayout())
-        igbc = GridBagConstraints()
-        igbc.anchor = GridBagConstraints.WEST
-        igbc.insets = Insets(1, 4, 1, 4)
-
-        labels = [self._lbl_status, self._lbl_token_info, self._lbl_expiry,
-                  self._lbl_refresh_ct, self._lbl_session]
-        for i, l in enumerate(labels):
-            igbc.gridx = 0; igbc.gridy = i
-            info_panel.add(l, igbc)
-
-        gbc.gridx = 0; gbc.gridy = 0
-        panel.add(btn_panel, gbc)
-        gbc.gridx = 0; gbc.gridy = 1
-        panel.add(info_panel, gbc)
-
-        panel.setBorder(TitledBorder(
-            BorderFactory.createEtchedBorder(EtchedBorder.LOWERED),
-            "  Control  "
-        ))
-        return panel
-
-    # -- Log panel ------------------------------------------------------
-
-    def _build_log_panel(self):
-        self._txt_log = JTextArea(8, 60)
-        self._txt_log.setEditable(False)
-        self._txt_log.setFont(Font("Monospaced", Font.PLAIN, 11))
-        self._txt_log.setLineWrap(True)
-        sp = JScrollPane(self._txt_log)
-        sp.setPreferredSize(Dimension(650, 160))
-        sp.setBorder(TitledBorder(
-            BorderFactory.createEtchedBorder(EtchedBorder.LOWERED),
-            "  Log  "
-        ))
-        return sp
-
-    # ------------------------------------------------------------------
-    # Button handlers
-    # ------------------------------------------------------------------
-
-    def _on_start(self, event):
-        missing = []
-        if not self._txt_sso_domain.getText().strip():
-            missing.append("SSO Domain")
-        if not self._txt_main_domain.getText().strip():
-            missing.append("Main Domain")
-        if not self._txt_client_id.getText().strip():
-            missing.append("Client ID")
-        if not self._txt_redirect_uri.getText().strip():
-            missing.append("Redirect URI")
-        if not self._txt_sso_cookies.getText().strip():
-            missing.append("SSO Cookies")
-        if missing:
-            self._log("Cannot start - missing: %s" % ", ".join(missing))
-            return
-
-        self._running = True
-        self._btn_start.setEnabled(False)
-        self._btn_stop.setEnabled(True)
-        self._btn_refresh.setEnabled(True)
-        self._log("Extension STARTED. Fetching initial token...")
-        t = threading.Thread(target=self._bg_initial_fetch)
-        t.setDaemon(True)
-        t.start()
-
-    def _on_stop(self, event):
-        self._running = False
-        self._btn_start.setEnabled(True)
-        self._btn_stop.setEnabled(False)
-        self._btn_refresh.setEnabled(False)
-        self._edt_status("Stopped")
-        self._log("Extension STOPPED.")
-
-    def _on_force_refresh(self, event):
-        self._invalidate_token()
-        self._log("Force refresh requested...")
-        t = threading.Thread(target=self._bg_refresh)
-        t.setDaemon(True)
-        t.start()
-
-    def _on_clear_log(self, event):
-        self._txt_log.setText("")
-
-    # -- Background token fetch threads ---------------------------------
-
-    def _bg_initial_fetch(self):
-        with self._token_lock:
-            self._do_refresh()
-        self._update_session_label()
-
-        t = threading.Thread(target=self._bg_expiry_monitor)
-        t.setDaemon(True)
-        t.start()
-
-    def _bg_refresh(self):
-        with self._token_lock:
-            self._do_refresh()
-        self._update_session_label()
-
-    def _bg_expiry_monitor(self):
-        """Background thread that updates the expiry label periodically."""
-        while self._running:
-            try:
-                if self._token_cache and self._token_expiry > 0:
-                    remaining = self._token_expiry - time.time()
-                    if remaining > 0:
-                        mins = int(remaining / 60)
-                        secs = int(remaining % 60)
-                        exp_str = time.strftime("%H:%M:%S", time.localtime(self._token_expiry))
-                        self._edt_status("Running - Token valid until %s (%dm %ds left)" % (
-                            exp_str, mins, secs))
-                    else:
-                        self._edt_status("Running - Token EXPIRED (will refresh on next request)")
-            except Exception:
-                pass
-            time.sleep(15)
-
-    def _update_session_label(self):
-        try:
-            jsid = self._jsessionid[:12] + "..." if self._jsessionid else "N/A"
-            igc  = self._ingresscookie[:12] + "..." if self._ingresscookie else "N/A"
-            text = "JSESSIONID: %s | INGRESSCOOKIE: %s" % (jsid, igc)
-            SwingUtilities.invokeLater(_RunnableUpdateSession(self, text))
-        except Exception:
-            pass
-
-    # ------------------------------------------------------------------
-    # Logging & status helpers
-    # ------------------------------------------------------------------
-
-    def _log(self, msg):
-        ts = time.strftime("%H:%M:%S")
-        line = "[%s] %s" % (ts, msg)
-        self._callbacks.printOutput(line)
-        try:
-            SwingUtilities.invokeLater(_RunnableAppendLog(self, line))
-        except Exception:
-            pass
-
-    def _edt_status(self, text):
-        try:
-            SwingUtilities.invokeLater(_RunnableUpdateStatus(self, text))
-        except Exception:
-            pass
-
-    def _update_token_info(self, text):
-        try:
-            SwingUtilities.invokeLater(_RunnableUpdateTokenInfo(self, text))
-        except Exception:
-            pass
+    def _reset_stats(self):
+        """Reset all statistics counters to zero."""
+        with self._stats_lock:
+            self._stats_headers_removed = 0
+            self._stats_params_removed = 0
+            self._stats_requests_processed = 0
+        SwingUtilities.invokeLater(UpdateStatsRunnable(self))
 
 
-# ---------------------------------------------------------------------------
-# Additional Runnable for session label
-# ---------------------------------------------------------------------------
+# ============================================================
+# ActionListener Classes (handle button clicks)
+# ============================================================
 
-class _RunnableUpdateSession(object):
-    def __init__(self, ext, text):
+class StartListener(ActionListener):
+    """Handle Start button click - begin processing requests."""
+    def __init__(self, ext):
         self._ext = ext
-        self._text = text
+
+    def actionPerformed(self, event):
+        self._ext._start_extension()
+        self._ext._add_log("INFO", "Extension STARTED - Processing requests on selected tools")
+
+
+class StopListener(ActionListener):
+    """Handle Stop button click - stop processing requests."""
+    def __init__(self, ext):
+        self._ext = ext
+
+    def actionPerformed(self, event):
+        self._ext._stop_extension()
+        self._ext._add_log("INFO", "Extension STOPPED - Requests pass through unmodified")
+
+
+class ClearLogListener(ActionListener):
+    """Handle Clear Log button click."""
+    def __init__(self, ext):
+        self._ext = ext
+
+    def actionPerformed(self, event):
+        with self._ext._log_lock:
+            self._ext._log_entries = []
+        self._ext._log_text.setText("")
+
+
+class ResetStatsListener(ActionListener):
+    """Handle Reset Stats button click."""
+    def __init__(self, ext):
+        self._ext = ext
+
+    def actionPerformed(self, event):
+        self._ext._reset_stats()
+
+
+class SelectAllToolsListener(ActionListener):
+    """Handle Select All / Deselect All tool checkboxes."""
+    def __init__(self, ext, select):
+        self._ext = ext
+        self._select = select
+
+    def actionPerformed(self, event):
+        for cb in self._ext._tool_checkboxes.values():
+            cb.setSelected(self._select)
+
+
+class ImportListener(ActionListener):
+    """Handle Import button click - load header/param list from file."""
+    def __init__(self, ext, target):
+        self._ext = ext
+        self._target = target  # "header" or "param"
+
+    def actionPerformed(self, event):
+        from javax.swing import JFileChooser
+        chooser = JFileChooser()
+        chooser.setDialogTitle("Import %s list" % self._target)
+        filter = FileNameExtensionFilter("Text files (*.txt)", ["txt"])
+        chooser.setFileFilter(filter)
+        if chooser.showOpenDialog(self._ext._panel) == JFileChooser.APPROVE_OPTION:
+            try:
+                selected_file = chooser.getSelectedFile()
+                with open(selected_file.getAbsolutePath(), 'r') as fh:
+                    content = fh.read()
+                if self._target == "header":
+                    self._ext._header_text.setText(content)
+                else:
+                    self._ext._param_text.setText(content)
+                self._ext._add_log(
+                    "INFO",
+                    "Imported %s list from %s" % (self._target, selected_file.getName())
+                )
+            except Exception as e:
+                self._ext._add_log("ERROR", "Import failed: %s" % str(e))
+
+
+class ExportListener(ActionListener):
+    """Handle Export button click - save header/param list to file."""
+    def __init__(self, ext, target):
+        self._ext = ext
+        self._target = target  # "header" or "param"
+
+    def actionPerformed(self, event):
+        from javax.swing import JFileChooser
+        chooser = JFileChooser()
+        chooser.setDialogTitle("Export %s list" % self._target)
+        filter = FileNameExtensionFilter("Text files (*.txt)", ["txt"])
+        chooser.setFileFilter(filter)
+        if chooser.showSaveDialog(self._ext._panel) == JFileChooser.APPROVE_OPTION:
+            try:
+                selected_file = chooser.getSelectedFile()
+                if self._target == "header":
+                    content = self._ext._header_text.getText()
+                else:
+                    content = self._ext._param_text.getText()
+                with open(selected_file.getAbsolutePath(), 'w') as fh:
+                    fh.write(content)
+                self._ext._add_log(
+                    "INFO",
+                    "Exported %s list to %s" % (self._target, selected_file.getName())
+                )
+            except Exception as e:
+                self._ext._add_log("ERROR", "Export failed: %s" % str(e))
+
+
+# ============================================================
+# Runnable Classes (for Swing EDT thread safety)
+# All UI updates MUST happen on the Event Dispatch Thread.
+# These Runnable classes are invoked via SwingUtilities.invokeLater().
+# ============================================================
+
+class SetStatusRunnable(Runnable):
+    """Update the Start/Stop button states and status label on Swing EDT."""
+    def __init__(self, ext, is_running):
+        self._ext = ext
+        self._is_running = is_running
+
     def run(self):
-        self._ext._lbl_session.setText(self._text)
+        if self._is_running:
+            self._ext._status_label.setText("RUNNING")
+            self._ext._status_label.setForeground(Color(0, 153, 0))  # Green
+            self._ext._start_btn.setEnabled(False)
+            self._ext._stop_btn.setEnabled(True)
+        else:
+            self._ext._status_label.setText("STOPPED")
+            self._ext._status_label.setForeground(Color(204, 0, 0))  # Dark red
+            self._ext._start_btn.setEnabled(True)
+            self._ext._stop_btn.setEnabled(False)
+
+
+class AppendLogRunnable(Runnable):
+    """Append a log entry to the log text area on Swing EDT."""
+    def __init__(self, ext, entry):
+        self._ext = ext
+        self._entry = entry
+
+    def run(self):
+        current = self._ext._log_text.getText()
+        # Truncate if too long to prevent memory issues and slow rendering
+        if len(current) > 50000:
+            current = current[-25000:]
+        self._ext._log_text.setText(current + self._entry + "\n")
+        # Auto-scroll to bottom
+        try:
+            self._ext._log_text.setCaretPosition(
+                self._ext._log_text.getDocument().getLength()
+            )
+        except Exception:
+            pass  # Non-critical; don't crash on caret positioning
+
+
+class UpdateStatsRunnable(Runnable):
+    """Update the statistics display label on Swing EDT."""
+    def __init__(self, ext):
+        self._ext = ext
+
+    def run(self):
+        self._ext._update_stats_display()
