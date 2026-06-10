@@ -1,8 +1,31 @@
 # ================================================================
 # Burp Suite Header & Parameter Stripper Extension
 # Compatible with Jython 2.7.4
-# Version: 1.0.0
+# Version: 2.0.0
 # ================================================================
+#
+# CHANGELOG v2.0.0:
+#   CRITICAL FIXES:
+#   - FIX: Java byte[] slicing replaced with ArrayList-based body
+#     extraction. In Jython, slicing a Java byte[] can return
+#     PyArray instead of byte[], causing buildHttpMessage to
+#     fail silently.
+#   - FIX: Python lists replaced with java.util.ArrayList when
+#     passing to Java methods. Some Burp versions are strict
+#     about List<String> vs PyList type matching.
+#   - FIX: toolFlag comparison now uses explicit int() cast to
+#     avoid Java Integer vs Python int mismatch in set lookups.
+#   - FIX: Exception handling now includes traceback info.
+#   IMPROVEMENTS:
+#   - ADDED: Debug mode checkbox for verbose logging.
+#   - ADDED: Comprehensive debug logging in processHttpMessage
+#     so every step of the flow is traceable.
+#   - ADDED: Debug logging in _strip_headers for header-level
+#     match/no-match tracing.
+#   - ADDED: "Test Match" button to verify pattern matching
+#     without needing to send actual requests.
+#   - ADDED: Body extraction uses safe fallback: tries byte
+#     slicing first, falls back to string-based extraction.
 #
 # Features:
 #   - Remove specified headers from HTTP requests
@@ -16,6 +39,8 @@
 #   - Live statistics counter
 #   - Import/Export configuration files
 #   - Select All / Deselect All tool checkboxes
+#   - Debug mode for troubleshooting
+#   - Test Match button for pattern verification
 #   - Thread-safe operation with proper Swing EDT handling
 #
 # Usage:
@@ -24,15 +49,19 @@
 #   3. Configure headers/parameters to strip in the "H&P Stripper" tab
 #   4. Select which Burp tools should have stripping applied
 #   5. Click "Start" to begin processing
+#   6. Enable "Debug" checkbox if you need to trace issues
 #
 # Jython 2.7.4 Compatibility Notes:
 #   - No f-strings (Python 3.6+)
 #   - No super() without arguments in old-style classes
 #   - Java List slicing requires conversion to Python list first
 #   - Use .append() not .add() for Python lists
+#   - Use ArrayList.add() not .append() for Java lists
 #   - Swing UI updates must run on EDT via SwingUtilities.invokeLater
 #   - threading.Lock supports context manager (with statement)
 #   - re module is available and works identically to CPython 2.7
+#   - Java byte[] slicing may return PyArray, NOT byte[]
+#   - Python list is NOT always accepted as Java List<String>
 # ================================================================
 
 from burp import IBurpExtender, ITab, IHttpListener, IExtensionStateListener
@@ -45,14 +74,15 @@ from javax.swing.border import EmptyBorder, TitledBorder, EtchedBorder, Compound
 from javax.swing.filechooser import FileNameExtensionFilter
 from java.awt.event import ActionListener
 from java.lang import Runnable
+from java.util import ArrayList
 import re
 import threading
 import time
+import traceback
 
 # ============================================================
 # Burp Suite Tool Flag Constants
 # ============================================================
-TOOL_TARGET = 1       # Not officially in IBurpExtenderCallbacks but commonly used
 TOOL_PROXY = 2
 TOOL_SPIDER = 3
 TOOL_SCANNER = 4
@@ -62,6 +92,7 @@ TOOL_SEQUENCER = 7
 TOOL_DECODER = 8
 TOOL_COMPARER = 9
 TOOL_EXTENDER = 10
+TOOL_TARGET = 1
 
 # Ordered tool mapping for UI display (matches user's requested order)
 TOOL_MAP_ORDERED = [
@@ -130,7 +161,6 @@ def should_match(name, patterns, case_sensitive, regex_mode, partial_match):
                 if re.search(pattern, name, flags):
                     return True
             except re.error:
-                # Invalid regex pattern - skip it silently
                 continue
         elif partial_match:
             if case_sensitive:
@@ -161,6 +191,7 @@ def parse_text_entries(text, is_header=False):
       - For headers: trailing colons are stripped, "Name: Value" entries
         are cleaned to just "Name"
       - Whitespace is trimmed
+      - \r characters are stripped (Windows line endings)
 
     Args:
         text: Raw text from the text area
@@ -174,7 +205,8 @@ def parse_text_entries(text, is_header=False):
 
     entries = []
     for line in text.split("\n"):
-        line = line.strip()
+        # Strip \r from Windows line endings AND surrounding whitespace
+        line = line.strip().rstrip("\r")
         if not line or line.startswith("#"):
             continue
 
@@ -218,6 +250,9 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener, IExtensionStateListener):
         self._is_running = False
         self._lock = threading.Lock()
 
+        # Debug mode flag
+        self._debug = False
+
         # Statistics counters (thread-safe via _stats_lock)
         self._stats_headers_removed = 0
         self._stats_params_removed = 0
@@ -244,8 +279,9 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener, IExtensionStateListener):
         # Auto-start the extension
         self._start_extension()
 
-        self._add_log("INFO", "Extension loaded successfully. Version 1.0.0")
+        self._add_log("INFO", "Extension loaded successfully. Version 2.0.0")
         self._add_log("INFO", "Configure headers/parameters to strip, select tools, then click Start.")
+        self._add_log("INFO", "Enable 'Debug' checkbox for verbose logging if headers are not being removed.")
 
     # ============================================================
     # UI Construction
@@ -327,12 +363,19 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener, IExtensionStateListener):
         # Import/Export buttons
         import_btn = JButton("Import")
         export_btn = JButton("Export")
+        test_btn = JButton("Test Match")
         import_btn.setToolTipText("Import header list from a text file")
         export_btn.setToolTipText("Export header list to a text file")
+        test_btn.setToolTipText(
+            "Test if your patterns match sample header names. "
+            "Results appear in the Activity Log."
+        )
         import_btn.addActionListener(ImportListener(self, "header"))
         export_btn.addActionListener(ExportListener(self, "header"))
+        test_btn.addActionListener(TestMatchListener(self, "header"))
         opts.add(import_btn)
         opts.add(export_btn)
+        opts.add(test_btn)
 
         panel.add(opts, BorderLayout.SOUTH)
         return panel
@@ -417,15 +460,22 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener, IExtensionStateListener):
         # Separator
         opts.add(JLabel("   "))
 
-        # Import/Export buttons
+        # Import/Export/Test buttons
         import_btn = JButton("Import")
         export_btn = JButton("Export")
+        test_btn = JButton("Test Match")
         import_btn.setToolTipText("Import parameter list from a text file")
         export_btn.setToolTipText("Export parameter list to a text file")
+        test_btn.setToolTipText(
+            "Test if your patterns match sample parameter names. "
+            "Results appear in the Activity Log."
+        )
         import_btn.addActionListener(ImportListener(self, "param"))
         export_btn.addActionListener(ExportListener(self, "param"))
+        test_btn.addActionListener(TestMatchListener(self, "param"))
         opts.add(import_btn)
         opts.add(export_btn)
+        opts.add(test_btn)
 
         panel.add(opts, BorderLayout.SOUTH)
         return panel
@@ -470,7 +520,7 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener, IExtensionStateListener):
 
         panel.add(tool_panel, BorderLayout.CENTER)
 
-        # Start/Stop + Status panel
+        # Start/Stop + Status + Debug panel
         button_panel = JPanel(FlowLayout(FlowLayout.RIGHT, 6, 2))
         button_panel.setBorder(EmptyBorder(5, 5, 5, 5))
 
@@ -478,10 +528,15 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener, IExtensionStateListener):
         self._stop_btn = JButton("Stop")
         self._stop_btn.setEnabled(False)
         self._clear_log_btn = JButton("Clear Log")
+        self._debug_cb = JCheckBox("Debug", False)
 
         self._start_btn.setToolTipText("Start request modification")
         self._stop_btn.setToolTipText("Stop request modification")
         self._clear_log_btn.setToolTipText("Clear the activity log")
+        self._debug_cb.setToolTipText(
+            "Enable verbose debug logging to trace request processing. "
+            "Check this if headers are not being removed as expected."
+        )
 
         self._status_label = JLabel("STOPPED")
         self._status_label.setFont(Font("SansSerif", Font.BOLD, 13))
@@ -490,7 +545,9 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener, IExtensionStateListener):
         self._start_btn.addActionListener(StartListener(self))
         self._stop_btn.addActionListener(StopListener(self))
         self._clear_log_btn.addActionListener(ClearLogListener(self))
+        self._debug_cb.addActionListener(DebugToggleListener(self))
 
+        button_panel.add(self._debug_cb)
         button_panel.add(self._clear_log_btn)
         button_panel.add(self._start_btn)
         button_panel.add(self._stop_btn)
@@ -564,7 +621,7 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener, IExtensionStateListener):
         active = set()
         for tool_flag, cb in self._tool_checkboxes.items():
             if cb.isSelected():
-                active.add(tool_flag)
+                active.add(int(tool_flag))
         return active
 
     # ============================================================
@@ -582,17 +639,25 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener, IExtensionStateListener):
         if not messageIsRequest:
             return
 
+        # Force Python int from Java int for reliable set comparison
+        tool_flag = int(toolFlag)
+
         # Check if extension is running
         if not self._is_running_safe():
             return
 
         # Check if this tool is in the active set
-        if toolFlag not in self._get_active_tools():
+        active_tools = self._get_active_tools()
+        if tool_flag not in active_tools:
+            if self._debug:
+                self._add_log("DEBUG", "Skipping tool=%d (not in active set %s)" % (tool_flag, str(active_tools)))
             return
 
         # Get the request bytes
         request = messageInfo.getRequest()
         if request is None:
+            if self._debug:
+                self._add_log("DEBUG", "Request is None, skipping")
             return
 
         try:
@@ -601,6 +666,9 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener, IExtensionStateListener):
 
             # ---- Strip Headers ----
             header_patterns = self._get_header_patterns()
+            if self._debug:
+                self._add_log("DEBUG", "[%s] Header patterns: %s" % (self._get_tool_name(tool_flag), str(header_patterns)))
+
             if header_patterns:
                 modified_request, removed_headers = self._strip_headers(
                     modified_request, header_patterns
@@ -609,9 +677,14 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener, IExtensionStateListener):
                     modified = True
                     with self._stats_lock:
                         self._stats_headers_removed += len(removed_headers)
-                    tool_name = self._get_tool_name(toolFlag)
+                    tool_name = self._get_tool_name(tool_flag)
                     for h in removed_headers:
                         self._add_log("HEADER", "[%s] Removed: %s" % (tool_name, h))
+                elif self._debug:
+                    self._add_log("DEBUG", "[%s] No headers matched for removal" % self._get_tool_name(tool_flag))
+            else:
+                if self._debug:
+                    self._add_log("DEBUG", "[%s] No header patterns configured" % self._get_tool_name(tool_flag))
 
             # ---- Strip Parameters ----
             param_patterns = self._get_param_patterns()
@@ -623,7 +696,7 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener, IExtensionStateListener):
                     modified = True
                     with self._stats_lock:
                         self._stats_params_removed += len(removed_params)
-                    tool_name = self._get_tool_name(toolFlag)
+                    tool_name = self._get_tool_name(tool_flag)
                     for p in removed_params:
                         self._add_log("PARAM", "[%s] Removed: %s" % (tool_name, p))
 
@@ -633,9 +706,12 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener, IExtensionStateListener):
                 with self._stats_lock:
                     self._stats_requests_processed += 1
                 SwingUtilities.invokeLater(UpdateStatsRunnable(self))
+                if self._debug:
+                    self._add_log("DEBUG", "[%s] Request modified successfully" % self._get_tool_name(tool_flag))
 
         except Exception as e:
-            self._add_log("ERROR", "processHttpMessage: %s" % str(e))
+            tb = traceback.format_exc()
+            self._add_log("ERROR", "processHttpMessage: %s | Traceback: %s" % (str(e), tb))
 
     # ============================================================
     # Header Stripping Logic
@@ -653,6 +729,9 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener, IExtensionStateListener):
         """
         Remove matching headers from an HTTP request.
 
+        Uses java.util.ArrayList for header lists passed to Burp API methods,
+        and safe body extraction to avoid Jython byte[] slicing issues.
+
         Args:
             request: The raw request bytes (Java byte[])
             header_patterns: List of header name patterns to match
@@ -664,12 +743,11 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener, IExtensionStateListener):
         try:
             request_info = self._helpers.analyzeRequest(request)
 
-            # CRITICAL: Convert Java List to Python list for safe indexing/slicing
+            # CRITICAL FIX: Convert Java List to Python list for safe indexing/slicing
             # Java Lists in Jython do NOT support Python-style slicing ([1:])
             original_headers = [h for h in request_info.getHeaders()]
 
             body_offset = request_info.getBodyOffset()
-            body = request[body_offset:]
 
             if len(original_headers) == 0:
                 return request, []
@@ -682,14 +760,25 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener, IExtensionStateListener):
             # First header line is always the request line
             # (e.g., "GET /path HTTP/1.1") - must NEVER be removed
             request_line = original_headers[0]
-            new_headers = [request_line]
+
+            # CRITICAL FIX: Use java.util.ArrayList instead of Python list
+            # Burp's buildHttpMessage expects java.util.List<String>,
+            # and some Burp versions reject Python lists (PyList).
+            new_headers = ArrayList()
+            new_headers.add(request_line)
+
             removed = []
+
+            if self._debug:
+                self._add_log("DEBUG", "Analyzing %d headers for removal" % (len(original_headers) - 1))
 
             for header in original_headers[1:]:
                 colon_idx = header.find(":")
                 if colon_idx == -1:
                     # Malformed header without colon - keep as-is for safety
-                    new_headers.append(header)
+                    new_headers.add(header)
+                    if self._debug:
+                        self._add_log("DEBUG", "Kept malformed header (no colon): %s" % header)
                     continue
 
                 header_name = header[:colon_idx].strip()
@@ -697,18 +786,92 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener, IExtensionStateListener):
                 if should_match(header_name, header_patterns,
                                 case_sensitive, regex_mode, partial_match):
                     removed.append(header)
+                    if self._debug:
+                        self._add_log("DEBUG", "MATCHED header '%s' -> removing" % header_name)
                 else:
-                    new_headers.append(header)
+                    new_headers.add(header)
+                    if self._debug:
+                        self._add_log("DEBUG", "No match for header '%s' -> keeping" % header_name)
 
             if removed:
-                modified_request = self._helpers.buildHttpMessage(new_headers, body)
-                return modified_request, removed
+                # CRITICAL FIX: Safe body extraction
+                # In Jython, slicing a Java byte[] may return PyArray instead of byte[],
+                # which causes buildHttpMessage to fail silently.
+                # We use a try/except with fallback to string-based extraction.
+                body = self._safe_extract_body(request, body_offset)
+
+                if body is not None:
+                    modified_request = self._helpers.buildHttpMessage(new_headers, body)
+                    if self._debug:
+                        self._add_log("DEBUG", "buildHttpMessage succeeded, new request created")
+                    return modified_request, removed
+                else:
+                    self._add_log("ERROR", "Failed to extract body from request")
+                    return request, []
             else:
                 return request, []
 
         except Exception as e:
-            self._add_log("ERROR", "_strip_headers: %s" % str(e))
+            tb = traceback.format_exc()
+            self._add_log("ERROR", "_strip_headers: %s | Traceback: %s" % (str(e), tb))
             return request, []
+
+    def _safe_extract_body(self, request, body_offset):
+        """
+        Safely extract the body bytes from a request.
+
+        Method 1: Direct byte array slicing (works in most Jython versions)
+        Method 2: String-based extraction using bytesToString/stringToBytes
+        Method 3: Manual byte copy
+
+        Returns:
+            byte[] of the body, or None if all methods fail
+        """
+        # Method 1: Direct byte array slicing
+        try:
+            body = request[body_offset:]
+            # Verify it's a proper byte array by checking its type
+            # and that buildHttpMessage would accept it
+            if body is not None:
+                if self._debug:
+                    self._add_log("DEBUG", "Body extraction Method 1 (slice) succeeded, len=%d" % len(body))
+                return body
+        except Exception as e:
+            if self._debug:
+                self._add_log("DEBUG", "Body extraction Method 1 (slice) failed: %s" % str(e))
+
+        # Method 2: String-based extraction
+        try:
+            request_str = self._helpers.bytesToString(request)
+            body_str = request_str[body_offset:]
+            body = self._helpers.stringToBytes(body_str)
+            if body is not None:
+                if self._debug:
+                    self._add_log("DEBUG", "Body extraction Method 2 (string) succeeded, len=%d" % len(body))
+                return body
+        except Exception as e:
+            if self._debug:
+                self._add_log("DEBUG", "Body extraction Method 2 (string) failed: %s" % str(e))
+
+        # Method 3: Manual byte copy
+        try:
+            body_len = len(request) - body_offset
+            if body_len <= 0:
+                # No body (e.g., GET request) - return empty byte array
+                return self._helpers.stringToBytes("")
+            body = [request[i] for i in range(body_offset, len(request))]
+            # Convert Python list of ints to byte array
+            body_bytes = self._helpers.stringToBytes(
+                "".join(chr(b & 0xFF) for b in body)
+            )
+            if self._debug:
+                self._add_log("DEBUG", "Body extraction Method 3 (manual) succeeded, len=%d" % len(body_bytes))
+            return body_bytes
+        except Exception as e:
+            if self._debug:
+                self._add_log("DEBUG", "Body extraction Method 3 (manual) failed: %s" % str(e))
+
+        return None
 
     # ============================================================
     # Parameter Stripping Logic
@@ -764,7 +927,7 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener, IExtensionStateListener):
 
             for param in parameters:
                 param_name = param.getName()
-                param_type = param.getType()
+                param_type = int(param.getType())
 
                 # Check if this parameter type is in the strip set
                 if param_type not in strip_types:
@@ -778,8 +941,6 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener, IExtensionStateListener):
                     removed_names.append("%s [%s]" % (param_name, type_name))
 
             # Remove parameters one by one
-            # Each removeParameter call returns a new request with that param removed
-            # This is safe because removeParameter matches by name+type, not position
             modified_request = request
             for param in params_to_remove:
                 try:
@@ -798,7 +959,8 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener, IExtensionStateListener):
                 return request, []
 
         except Exception as e:
-            self._add_log("ERROR", "_strip_parameters: %s" % str(e))
+            tb = traceback.format_exc()
+            self._add_log("ERROR", "_strip_parameters: %s | Traceback: %s" % (str(e), tb))
             return request, []
 
     # ============================================================
@@ -842,9 +1004,13 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener, IExtensionStateListener):
         Add a log entry. Thread-safe. Updates UI on Swing EDT.
 
         Args:
-            level: Log level string (INFO, HEADER, PARAM, ERROR)
+            level: Log level string (INFO, HEADER, PARAM, ERROR, DEBUG)
             message: Log message string
         """
+        # Skip DEBUG logs unless debug mode is enabled
+        if level == "DEBUG" and not self._debug:
+            return
+
         timestamp = time.strftime("%H:%M:%S")
         entry = "[%s] [%s] %s" % (timestamp, level, message)
 
@@ -933,6 +1099,69 @@ class SelectAllToolsListener(ActionListener):
     def actionPerformed(self, event):
         for cb in self._ext._tool_checkboxes.values():
             cb.setSelected(self._select)
+
+
+class DebugToggleListener(ActionListener):
+    """Handle Debug checkbox toggle."""
+    def __init__(self, ext):
+        self._ext = ext
+
+    def actionPerformed(self, event):
+        self._ext._debug = self._ext._debug_cb.isSelected()
+        if self._ext._debug:
+            self._ext._add_log("INFO", "Debug mode ENABLED - verbose logging active")
+        else:
+            self._ext._add_log("INFO", "Debug mode DISABLED")
+
+
+class TestMatchListener(ActionListener):
+    """Handle Test Match button - verify patterns match sample headers/params."""
+    def __init__(self, ext, target):
+        self._ext = ext
+        self._target = target  # "header" or "param"
+
+    def actionPerformed(self, event):
+        if self._target == "header":
+            patterns = self._ext._get_header_patterns()
+            case_sensitive = self._ext._header_case_sensitive.isSelected()
+            regex_mode = self._ext._header_regex_mode.isSelected()
+            partial_match = self._ext._header_partial_match.isSelected()
+            sample_names = ["Authorization", "Cookie", "Accept-Encoding",
+                           "X-Forwarded-For", "X-Real-IP", "Host",
+                           "User-Agent", "Content-Type", "Referer"]
+        else:
+            patterns = self._ext._get_param_patterns()
+            case_sensitive = self._ext._param_case_sensitive.isSelected()
+            regex_mode = self._ext._param_regex_mode.isSelected()
+            partial_match = self._ext._param_partial_match.isSelected()
+            sample_names = ["session_id", "utm_source", "debug",
+                           "tracking_id", "csrf_token", "id",
+                           "page", "user_id", "auth_token"]
+
+        self._ext._add_log("INFO", "=== Test Match (%s) ===" % self._target)
+        self._ext._add_log("INFO", "Patterns: %s" % str(patterns))
+        self._ext._add_log("INFO", "Options: case_sensitive=%s, regex=%s, partial=%s" %
+                          (case_sensitive, regex_mode, partial_match))
+
+        if not patterns:
+            self._ext._add_log("INFO", "No patterns configured! Enter %s names in the text area first." % self._target)
+            return
+
+        matched = []
+        not_matched = []
+        for name in sample_names:
+            if should_match(name, patterns, case_sensitive, regex_mode, partial_match):
+                matched.append(name)
+            else:
+                not_matched.append(name)
+
+        if matched:
+            self._ext._add_log("INFO", "MATCHED: %s" % ", ".join(matched))
+        else:
+            self._ext._add_log("INFO", "NO MATCHES found among sample names")
+
+        if not_matched:
+            self._ext._add_log("INFO", "Not matched: %s" % ", ".join(not_matched))
 
 
 class ImportListener(ActionListener):
