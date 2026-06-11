@@ -8,8 +8,7 @@ from java.lang import Runnable
 
 class StateManager(object):
     """
-    I refuse to read from UI components during HTTP processing. 
-    This state manager holds O(1) sets for instantaneous lookups.
+    O(1) sets for instantaneous lookups.
     """
     def __init__(self):
         self.is_running = False
@@ -29,6 +28,7 @@ class UIUpdateListener(DocumentListener):
     def update(self):
         text = self.text_area.getText()
         self.state_set.clear()
+        # Handles your exact input format: "OStoken,Defaultuserrole"
         for line in text.replace(',', '\n').split('\n'):
             line = line.strip()
             if line:
@@ -50,6 +50,9 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab):
         # Initialize ultra-fast state object
         self.state = StateManager()
         
+        # THE MISSING IGNITION KEY: TELL BURP TO ROUTE HTTP TRAFFIC TO THIS EXTENSION!
+        self.callbacks.registerHttpListener(self)
+        
         # Tool Flags Mapping (Burp Constants)
         self.tool_map = {
             "Target": callbacks.TOOL_TARGET,
@@ -61,11 +64,11 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab):
             "Repeater": callbacks.TOOL_REPEATER
         }
 
-        # Build UI on the Event Dispatch Thread like a professional.
+        # Build UI on the Event Dispatch Thread safely
         SwingUtilities.invokeLater(UIRunnable(self))
 
     def processHttpMessage(self, toolFlag, messageIsRequest, messageInfo):
-        # 1. IMMEDIATE FAIL-FAST CHECKS. Zero overhead if not applicable.
+        # 1. IMMEDIATE FAIL-FAST CHECKS
         if not messageIsRequest:
             return
         if not self.state.is_running:
@@ -76,9 +79,7 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab):
         request_bytes = messageInfo.getRequest()
         modified = False
 
-        # 2. PARAMETER REMOVAL (MUST BE DONE FIRST)
-        # Why? Because removeParameter recalculates the entire byte array. 
-        # If we did headers first, the offsets would break. I thought of everything.
+        # 2. PARAMETER REMOVAL (MUST BE DONE FIRST TO PRESERVE BYTE OFFSETS)
         if self.state.target_params:
             info = self.helpers.analyzeRequest(request_bytes)
             params = info.getParameters()
@@ -102,10 +103,15 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab):
             for header in headers:
                 # The first line (e.g., GET / HTTP/1.1) doesn't have a colon. Skip it safely.
                 if ":" in header:
+                    # Extracts the header name and converts to lowercase
                     header_name = header.split(":", 1)[0].strip().lower()
+                    
+                    # If the user typed "OStoken", it is stored as "ostoken".
+                    # The request's "OStoken: value" is checked as "ostoken". THIS WILL MATCH!
                     if header_name in self.state.target_headers:
                         headers_modified = True
                         continue # DESTROY THE HEADER!
+                
                 new_headers.append(header)
 
             if headers_modified:
@@ -125,7 +131,7 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab):
 
 class UIRunnable(Runnable):
     """
-    Swing UI Builder. Separated into a Runnable to strictly adhere to Java EDT rules.
+    Swing UI Builder.
     """
     def __init__(self, extender):
         self.extender = extender
@@ -154,7 +160,7 @@ class UIRunnable(Runnable):
             cb = JCheckBox(name)
             cb.setFont(Font("Arial", Font.PLAIN, 14))
             if "Proxy" in name:
-                cb.setForeground(Color.RED) # Caution label styling
+                cb.setForeground(Color.RED)
             cb.addActionListener(lambda e, f=flag, c=cb: self.update_tools(f, c))
             self.checkboxes[name] = cb
             left_panel.add(cb)
