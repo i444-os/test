@@ -1,8 +1,8 @@
 # -*- coding: utf-8 -*-
 """
-OAuth Token Manager v5 - ARCHITECTURALLY CORRECT
-Fixes: Separates API Domain (JWT) from Main Domain (JSESSIONID).
-Strict in-place JSESSIONID replacement. Global header stripping.
+OAuth Token Manager v6 - SURGICAL REPLACE-ONLY EDITION
+Fixes: Strict in-place JSESSIONID replacement (NO ADDING). 
+Applies to ALL URLs on Main Domain. No path exclusions.
 Compatible with: Burp Suite + Jython Standalone 2.7.4
 """
 
@@ -61,13 +61,13 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab, IExtensionStateListener, 
         self._build_ui()
         self._load_settings()
 
-        callbacks.setExtensionName("OAuth Token Manager v5")
+        callbacks.setExtensionName("OAuth Token Manager v6")
         callbacks.addSuiteTab(self)
         callbacks.registerHttpListener(self)
         callbacks.registerExtensionStateListener(self)
         callbacks.registerContextMenuFactory(self)
 
-        self._stdout.println("[OAuth Token Manager v5] Loaded. API Domain and Main Domain separated.")
+        self._stdout.println("[OAuth Token Manager v6] Loaded. SURGICAL REPLACE-ONLY mode active.")
 
     def getTabCaption(self):
         return "OAuth Token Mgr"
@@ -90,8 +90,7 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab, IExtensionStateListener, 
     def _inject_ui(self, invocation):
         try:
             messages = invocation.getSelectedMessages()
-            if not messages:
-                return
+            if not messages: return
             for msg in messages:
                 req = msg.getRequest()
                 if req:
@@ -106,19 +105,13 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab, IExtensionStateListener, 
                     main_domain = self._main_domain_field.getText().strip().lower()
                     api_domain = self._api_domain_field.getText().strip().lower()
                     
-                    # Route JSESSIONID to Main Domain
                     if main_domain and main_domain in host:
-                        if self._jsessionid:
-                            replace_cookies["JSESSIONID"] = self._jsessionid
-                            
-                    # Route JWT to API Domain
+                        if self._jsessionid: replace_cookies["JSESSIONID"] = self._jsessionid
                     if api_domain and api_domain in host:
-                        if self._ensure_token() and self._jwt_token:
-                            add_auth_headers["Authorization"] = "Bearer %s" % self._jwt_token
-                            
+                        if self._ensure_token() and self._jwt_token: add_auth_headers["Authorization"] = "Bearer %s" % self._jwt_token
+                        
                     if strip_list or add_auth_headers or replace_cookies:
-                        new_req = self._modify_request(req, strip_list, add_auth_headers, replace_cookies)
-                        msg.setRequest(new_req)
+                        msg.setRequest(self._modify_request(req, strip_list, add_auth_headers, replace_cookies))
                         self._log("UI UPDATED: Visually injected tokens into Editor.")
         except Exception as e:
             self._log("ERROR in context menu: %s" % str(e))
@@ -158,7 +151,6 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab, IExtensionStateListener, 
         center_panel = JPanel()
         center_panel.setLayout(BoxLayout(center_panel, BoxLayout.Y_AXIS))
 
-        # -- DOMAINS --
         domain_panel = JPanel(GridBagLayout())
         domain_panel.setBorder(BorderFactory.createTitledBorder("Domain Routing Configuration"))
         gbc = GridBagConstraints()
@@ -189,7 +181,6 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab, IExtensionStateListener, 
         center_panel.add(domain_panel)
         center_panel.add(Box.createVerticalStrut(5))
 
-        # -- PATHS --
         oauth_panel = JPanel(GridBagLayout())
         oauth_panel.setBorder(BorderFactory.createTitledBorder("OAuth Path Configuration"))
         gbc = GridBagConstraints()
@@ -220,7 +211,6 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab, IExtensionStateListener, 
         center_panel.add(oauth_panel)
         center_panel.add(Box.createVerticalStrut(5))
 
-        # -- COOKIE & HEADERS --
         cookie_panel = JPanel(BorderLayout())
         cookie_panel.setBorder(BorderFactory.createTitledBorder("SSO Cookie (Paste daily)"))
         self._sso_cookie_area = JTextArea(4, 50)
@@ -236,7 +226,6 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab, IExtensionStateListener, 
         center_panel.add(headers_panel)
         center_panel.add(Box.createVerticalStrut(5))
 
-        # -- TOOLS & STATUS --
         tool_panel = JPanel(FlowLayout(FlowLayout.LEFT, 10, 5))
         tool_panel.setBorder(BorderFactory.createTitledBorder("Tool Scope"))
         for tool_name in ["Target", "Proxy", "Repeater", "Intruder", "Scanner", "Sequencer", "Extensions"]:
@@ -283,7 +272,6 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab, IExtensionStateListener, 
         center_panel.add(status_panel)
         center_panel.add(Box.createVerticalStrut(5))
 
-        # -- LOG --
         log_panel = JPanel(BorderLayout())
         log_panel.setBorder(BorderFactory.createTitledBorder("Log"))
         self._log_area = JTextArea(8, 50)
@@ -320,7 +308,6 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab, IExtensionStateListener, 
             request_info = self._helpers.analyzeRequest(http_service, request)
             url = request_info.getUrl()
             host = url.getHost().lower()
-            path = url.getPath()
 
             strip_list = list(self._headers_to_remove_lower)
             add_auth_headers = {}
@@ -328,23 +315,20 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab, IExtensionStateListener, 
             
             main_domain = self._main_domain_field.getText().strip().lower()
             api_domain = self._api_domain_field.getText().strip().lower()
-            token_path = self._token_path_field.getText().strip()
-            callback_path = self._callback_path_field.getText().strip()
             
-            # Prevent injecting into our own auth flow
-            is_auth_flow = (main_domain in host and token_path and path.startswith(token_path)) or \
-                           (main_domain in host and callback_path and path.startswith(callback_path))
+            # NO MORE PATH EXCLUSIONS. 
+            # self._auth_local.in_progress already protects the extension's internal requests.
+            # This ensures JSESSIONID is replaced on EVERY SINGLE URL on the main domain.
             
-            if not is_auth_flow:
-                # 1. ROUTE JSESSIONID TO MAIN DOMAIN
-                if main_domain and main_domain in host:
-                    if self._jsessionid:
-                        replace_cookies["JSESSIONID"] = self._jsessionid
+            # 1. ROUTE JSESSIONID TO MAIN DOMAIN (EVERYWHERE)
+            if main_domain and main_domain in host:
+                if self._jsessionid:
+                    replace_cookies["JSESSIONID"] = self._jsessionid
                         
-                # 2. ROUTE JWT TO API DOMAIN
-                if api_domain and api_domain in host:
-                    if self._ensure_token() and self._jwt_token:
-                        add_auth_headers["Authorization"] = "Bearer %s" % self._jwt_token
+            # 2. ROUTE JWT TO API DOMAIN
+            if api_domain and api_domain in host:
+                if self._ensure_token() and self._jwt_token:
+                    add_auth_headers["Authorization"] = "Bearer %s" % self._jwt_token
 
             if strip_list or add_auth_headers or replace_cookies:
                 new_request = self._modify_request(request, strip_list, add_auth_headers, replace_cookies)
@@ -374,7 +358,7 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab, IExtensionStateListener, 
             pass
 
     # ========================================================================
-    # BULLETPROOF REQUEST MODIFICATION (STRICT IN-PLACE REPLACEMENT)
+    # SURGICAL REQUEST MODIFICATION (REPLACE ONLY - NO ADDING)
     # ========================================================================
 
     def _modify_request(self, request_bytes, strip_headers_lower=None, add_headers=None, replace_cookies=None):
@@ -394,29 +378,31 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab, IExtensionStateListener, 
                     headers.append("%s: %s" % (name, value))
                     
             # 3. STRICT IN-PLACE JSESSIONID REPLACEMENT (Main Domain)
-            if replace_cookies:
+            # ONLY replaces if JSESSIONID is ALREADY in the original request. NO ADDING.
+            if replace_cookies and "JSESSIONID" in replace_cookies:
                 for i, h in enumerate(headers):
                     if h.lower().startswith("cookie:"):
                         cookie_header_val = h.split(":", 1)[1].strip()
                         new_cookie_parts = []
-                        jsessionid_replaced = False
+                        jsessionid_found_in_og = False
                         
                         for part in cookie_header_val.split(";"):
                             if "=" in part:
                                 k, v = part.split("=", 1)
-                                k = k.strip()
-                                if k.upper() == "JSESSIONID" and "JSESSIONID" in replace_cookies:
-                                    new_cookie_parts.append("%s=%s" % (k, replace_cookies["JSESSIONID"]))
-                                    jsessionid_replaced = True
+                                k_stripped = k.strip()
+                                if k_stripped.upper() == "JSESSIONID":
+                                    # SURGICAL REPLACEMENT
+                                    new_cookie_parts.append("%s=%s" % (k_stripped, replace_cookies["JSESSIONID"]))
+                                    jsessionid_found_in_og = True
                                 else:
                                     new_cookie_parts.append(part.strip())
                             else:
-                                new_cookie_parts.append(part.strip())
-                                
-                        if not jsessionid_replaced and "JSESSIONID" in replace_cookies:
-                            new_cookie_parts.append("JSESSIONID=%s" % replace_cookies["JSESSIONID"])
-                            
-                        headers[i] = "Cookie: %s" % "; ".join(new_cookie_parts)
+                                if part.strip():
+                                    new_cookie_parts.append(part.strip())
+                                    
+                        # ONLY rewrite the header if JSESSIONID was actually found in the original request
+                        if jsessionid_found_in_og:
+                            headers[i] = "Cookie: %s" % "; ".join(new_cookie_parts)
                         break
                         
             return self._helpers.buildHttpMessage(headers, body)
@@ -483,7 +469,6 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab, IExtensionStateListener, 
             token_path = self._token_path_field.getText().strip()
             sso_cookie = self._sso_cookie_area.getText().strip()
 
-            # Step 1
             r1 = self._make_request("https://%s%s" % (sso_domain, auth_path), {"Cookie": sso_cookie})
             if not r1 or not r1.getResponse(): return False
             loc = [h.split(":",1)[1].strip() for h in self._helpers.analyzeResponse(r1.getResponse()).getHeaders() if h.lower().startswith("location:")]
@@ -491,7 +476,6 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab, IExtensionStateListener, 
             code = parse_qs(urlparse(loc[0]).query).get('code', [None])[0]
             if not code: return False
 
-            # Step 2
             r2 = self._make_request(loc[0], {"Referer": "https://%s/" % sso_domain})
             if not r2 or not r2.getResponse(): return False
             jsessionid = None
@@ -499,7 +483,6 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab, IExtensionStateListener, 
                 if c.getName() and "JSESSIONID" in c.getName().upper(): jsessionid = c.getValue()
             if not jsessionid: return False
 
-            # Step 3
             r3 = self._make_request("https://%s%s" % (main_domain, token_path), {
                 "Cookie": "JSESSIONID=%s" % jsessionid, "Accept": "application/json", "Referer": "https://%s%s" % (main_domain, callback_path)
             })
@@ -592,7 +575,7 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab, IExtensionStateListener, 
 
     def _save_settings(self):
         try:
-            self._callbacks.saveExtensionSetting("oauth_v5", json.dumps({
+            self._callbacks.saveExtensionSetting("oauth_v6", json.dumps({
                 "sso": self._sso_domain_field.getText(), "main": self._main_domain_field.getText(), "api": self._api_domain_field.getText(),
                 "auth": self._authorize_path_field.getText(), "cb": self._callback_path_field.getText(), "tok": self._token_path_field.getText(),
                 "hdr": self._headers_to_remove_area.getText(), "tools": {n: c.isSelected() for n, c in self._tool_checkboxes.items()}
@@ -601,7 +584,7 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab, IExtensionStateListener, 
 
     def _load_settings(self):
         try:
-            c = json.loads(self._callbacks.loadExtensionSetting("oauth_v5") or "{}")
+            c = json.loads(self._callbacks.loadExtensionSetting("oauth_v6") or "{}")
             self._sso_domain_field.setText(c.get("sso", "sso.com"))
             self._main_domain_field.setText(c.get("main", "main.com"))
             self._api_domain_field.setText(c.get("api", "api.main.com"))
