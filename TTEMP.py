@@ -1,8 +1,7 @@
 # -*- coding: utf-8 -*-
 """
-OAuth Token Manager v8 - FINAL FLAWLESS EDITION
-Fixes: Registered ISessionHandlingAction, removed crashing ContextMenu.
-Strict in-place JSESSIONID replacement. HTTP/2 compatible.
+OAuth Token Manager v9 - STRICT BOUNDARY ROUTING
+Fixes: Substring matching bug. JWT will NEVER leak to Main Domain.
 Compatible with: Burp Suite + Jython Standalone 2.7.4
 """
 
@@ -50,17 +49,13 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab, IExtensionStateListener, 
         self._build_ui()
         self._load_settings()
 
-        callbacks.setExtensionName("OAuth Token Manager v8")
+        callbacks.setExtensionName("OAuth Token Manager v9")
         callbacks.addSuiteTab(self)
-        
-        # 1. Register HttpListener ONLY for 401 monitoring
         callbacks.registerHttpListener(self)
         callbacks.registerExtensionStateListener(self)
-        
-        # 2. CRITICAL FIX: REGISTER THE SESSION HANDLING ACTION!
         callbacks.registerSessionHandlingAction(self)
 
-        self._stdout.println("[OAuth Token Manager v8] Loaded. Session Handling Action REGISTERED. Add the rule in Burp Settings -> Sessions!")
+        self._stdout.println("[OAuth Token Manager v9] Loaded. Strict Boundary Routing Active.")
 
     def getTabCaption(self):
         return "OAuth Token Mgr"
@@ -69,7 +64,18 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab, IExtensionStateListener, 
         return self._main_panel
 
     # ========================================================================
-    # ISessionHandlingAction (THE HTTP/2 & HTTP/1.1 FIX)
+    # STRICT DOMAIN MATCHING ENGINE
+    # ========================================================================
+
+    def _is_exact_or_subdomain(self, host, domain):
+        if not domain:
+            return False
+        h = host.lower().strip()
+        d = domain.lower().strip()
+        return h == d or h.endswith('.' + d)
+
+    # ========================================================================
+    # ISessionHandlingAction (HTTP/2 & HTTP/1.1 COMPATIBLE)
     # ========================================================================
 
     def getActionName(self):
@@ -79,29 +85,56 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab, IExtensionStateListener, 
         if not self._running:
             return
             
-        # Prevent race condition: wait if auth flow is currently running
         if not self._auth_event.isSet():
             self._auth_event.wait(timeout=10.0)
 
         try:
             req_bytes = currentRequest.getRequest()
             req_info = self._helpers.analyzeRequest(currentRequest.getHttpService(), req_bytes)
-            host = req_info.getUrl().getHost().lower()
+            url = req_info.getUrl()
+            host = url.getHost().lower()
+            path = url.getPath()
+
+            main_domain = self._main_domain_field.getText().strip().lower()
+            api_domain = self._api_domain_field.getText().strip().lower()
+            sso_domain = self._sso_domain_field.getText().strip().lower()
+            
+            token_path = self._token_path_field.getText().strip()
+            callback_path = self._callback_path_field.getText().strip()
+            auth_path = self._authorize_path_field.getText().strip().split('?')[0]
+
+            # 1. PROTECT AUTH FLOW (DO NOT MODIFY THESE REQUESTS)
+            is_auth_flow = False
+            if self._is_exact_or_subdomain(host, sso_domain) and path == auth_path:
+                is_auth_flow = True
+            if self._is_exact_or_subdomain(host, main_domain) and (path == token_path or path == callback_path):
+                is_auth_flow = True
+                
+            if is_auth_flow:
+                return 
 
             strip_list = list(self._headers_to_remove_lower)
             add_auth_headers = {}
             replace_cookies = {}
             
-            main_domain = self._main_domain_field.getText().strip().lower()
-            api_domain = self._api_domain_field.getText().strip().lower()
+            # 2. STRICT DOMAIN ROUTING (NO SUBSTRING MATCHING)
+            main_match = self._is_exact_or_subdomain(host, main_domain)
+            api_match = self._is_exact_or_subdomain(host, api_domain)
             
-            # 1. ROUTE JSESSIONID TO MAIN DOMAIN (STRICT REPLACE ONLY)
-            if main_domain and main_domain in host:
+            # Resolve overlaps by choosing the most specific (longest) domain
+            if main_match and api_match:
+                if len(api_domain) > len(main_domain):
+                    main_match = False
+                else:
+                    api_match = False
+                    
+            # ROUTE JSESSIONID TO MAIN DOMAIN ONLY
+            if main_match:
                 if self._jsessionid:
                     replace_cookies["JSESSIONID"] = self._jsessionid
-                        
-            # 2. ROUTE JWT TO API DOMAIN
-            if api_domain and api_domain in host:
+                    
+            # ROUTE JWT TO API DOMAIN ONLY
+            if api_match:
                 if self._ensure_token() and self._jwt_token:
                     add_auth_headers["Authorization"] = "Bearer %s" % self._jwt_token
 
@@ -130,7 +163,7 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab, IExtensionStateListener, 
                 host = req_info.getUrl().getHost().lower()
                 api_domain = self._api_domain_field.getText().strip().lower()
                 
-                if api_domain and api_domain in host:
+                if self._is_exact_or_subdomain(host, api_domain):
                     self._log("ALERT: 401 on API Domain - invalidating JWT")
                     with self._auth_lock:
                         self._jwt_token = None
@@ -498,7 +531,7 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab, IExtensionStateListener, 
 
     def _save_settings(self):
         try:
-            self._callbacks.saveExtensionSetting("oauth_v8", json.dumps({
+            self._callbacks.saveExtensionSetting("oauth_v9", json.dumps({
                 "sso": self._sso_domain_field.getText(), "main": self._main_domain_field.getText(), "api": self._api_domain_field.getText(),
                 "auth": self._authorize_path_field.getText(), "cb": self._callback_path_field.getText(), "tok": self._token_path_field.getText(),
                 "hdr": self._headers_to_remove_area.getText()
@@ -507,7 +540,7 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab, IExtensionStateListener, 
 
     def _load_settings(self):
         try:
-            c = json.loads(self._callbacks.loadExtensionSetting("oauth_v8") or "{}")
+            c = json.loads(self._callbacks.loadExtensionSetting("oauth_v9") or "{}")
             self._sso_domain_field.setText(c.get("sso", "sso.com"))
             self._main_domain_field.setText(c.get("main", "main.com"))
             self._api_domain_field.setText(c.get("api", "api.main.com"))
