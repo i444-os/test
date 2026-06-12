@@ -1,11 +1,11 @@
+# -*- coding: utf-8 -*-
 """
 OAuth Token Manager v2 - License-Safe Edition
 Prevents license exhaustion by separating JWT refresh from full auth flow.
-
 Compatible with: Burp Suite + Jython Standalone 2.7.4
 """
 
-from burp import IBurpExtender, IHttpListener, ITab, IExtensionStateListener
+from burp import IBurpExtender, IHttpListener, ITab, IExtensionStateListener, IBurpExtenderCallbacks
 
 from java.io import PrintWriter
 from java.awt import (BorderLayout, FlowLayout, GridBagLayout, GridBagConstraints,
@@ -38,9 +38,9 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab, IExtensionStateListener):
         self._jwt_token = None
         self._jsessionid = None
         self._jwt_expiry = 0
-        self._jsessionid_alive = False  # Track if JSESSIONID is known to be valid
-        self._full_auth_count = 0       # License usage counter
-        self._jwt_refresh_count = 0     # Free refresh counter
+        self._jsessionid_alive = False
+        self._full_auth_count = 0
+        self._jwt_refresh_count = 0
 
         self._auth_lock = threading.Lock()
         self._auth_local = threading.local()
@@ -66,7 +66,7 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab, IExtensionStateListener):
         callbacks.registerHttpListener(self)
         callbacks.registerExtensionStateListener(self)
 
-        self._stdout.println("[OAuth Token Manager v2] License-safe extension loaded")
+        self._stdout.println("[OAuth Token Manager v2] License-safe extension loaded successfully")
 
     # ========================================================================
     # ITab
@@ -172,7 +172,7 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab, IExtensionStateListener):
 
         # -- SSO Cookie --
         cookie_panel = JPanel(BorderLayout())
-        cookie_panel.setBorder(BorderFactory.createTitledBorder("SSO Cookie (Paste daily - the big cookie from 1st request)"))
+        cookie_panel.setBorder(BorderFactory.createTitledBorder("SSO Cookie (Paste daily)"))
         self._sso_cookie_area = JTextArea(4, 50)
         self._sso_cookie_area.setLineWrap(True)
         self._sso_cookie_area.setWrapStyleWord(True)
@@ -182,7 +182,7 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab, IExtensionStateListener):
 
         # -- Headers to Remove --
         headers_panel = JPanel(BorderLayout())
-        headers_panel.setBorder(BorderFactory.createTitledBorder("Headers to Remove (one per line, removed from ALL requests except auth flow)"))
+        headers_panel.setBorder(BorderFactory.createTitledBorder("Headers to Remove (one per line)"))
         self._headers_to_remove_area = JTextArea(3, 50)
         self._headers_to_remove_area.setLineWrap(False)
         headers_panel.add(JScrollPane(self._headers_to_remove_area), BorderLayout.CENTER)
@@ -310,7 +310,6 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab, IExtensionStateListener):
 
             main_domain = self._main_domain_field.getText().strip().lower()
             if main_domain and main_domain in host.lower():
-                # Skip auth flow URLs themselves
                 path = url.getPath()
                 token_path = self._token_path_field.getText().strip()
                 callback_path = self._callback_path_field.getText().strip()
@@ -355,16 +354,10 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab, IExtensionStateListener):
             self._log("ERROR in _process_response: %s" % str(e))
 
     # ========================================================================
-    # LICENSE-SAFE TOKEN MANAGEMENT (THE CRITICAL FIX)
+    # LICENSE-SAFE TOKEN MANAGEMENT
     # ========================================================================
 
     def _ensure_token(self):
-        """
-        Double-checked locking with LICENSE-SAFE refresh strategy:
-        1. If JWT valid → return True (no network call)
-        2. If JWT expired but JSESSIONID alive → JWT-only refresh (FREE, no license)
-        3. If JSESSIONID dead → Full auth (costs 1 license)
-        """
         if self._is_token_valid():
             return True
 
@@ -372,24 +365,16 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab, IExtensionStateListener):
             if self._is_token_valid():
                 return True
 
-            # Strategy 1: Try JWT-only refresh if JSESSIONID is alive
             if self._jsessionid and self._jsessionid_alive:
                 self._log("STRATEGY: JWT-only refresh (no license cost)")
                 result = self._jwt_refresh_only()
                 if result:
                     return True
-                # If JWT refresh failed (302), JSESSIONID is dead → fall through to full auth
 
-            # Strategy 2: Full auth (costs 1 license)
             self._log("STRATEGY: Full auth flow (costs 1 license)")
             return self._full_authenticate()
 
     def _jwt_refresh_only(self):
-        """
-        Refresh JWT using EXISTING JSESSIONID (Step 3 only).
-        Returns True on success, False if JSESSIONID is dead (302 detected).
-        DOES NOT consume a license.
-        """
         if not self._running or not self._jsessionid:
             return False
 
@@ -426,13 +411,11 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab, IExtensionStateListener):
             resp_info = self._helpers.analyzeResponse(resp_bytes)
             status = resp_info.getStatusCode()
 
-            # KEY DETECTION: 302 means JSESSIONID is DEAD
             if status in [301, 302, 303, 307]:
-                self._log("DETECTED 302 on /token → JSESSIONID is EXPIRED/DEAD")
-                self._log("Will need full auth on next attempt (costs 1 license)")
+                self._log("DETECTED 302 on /token -> JSESSIONID is EXPIRED/DEAD")
                 self._jsessionid_alive = False
                 self._update_jsessionid_status("DEAD (302 redirect)")
-                self._update_auth_status("JSESSIONID Dead → Need Full Auth")
+                self._update_auth_status("JSESSIONID Dead -> Need Full Auth")
                 return False
 
             if status != 200:
@@ -440,7 +423,6 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab, IExtensionStateListener):
                 self._update_auth_status("JWT Refresh FAILED (%d)" % status)
                 return False
 
-            # Parse JWT from response
             body_offset = resp_info.getBodyOffset()
             body_bytes = resp_bytes[body_offset:]
             body_str = self._helpers.bytesToString(body_bytes)
@@ -456,7 +438,6 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab, IExtensionStateListener):
                 self._log("FAIL: No 'token' in JSON response")
                 return False
 
-            # Cache the new JWT (JSESSIONID stays the same!)
             self._jwt_token = jwt
             self._jwt_expiry = self._parse_jwt_expiry(jwt)
             self._jwt_refresh_count += 1
@@ -477,14 +458,9 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab, IExtensionStateListener):
             self._auth_local.in_progress = False
 
     def _full_authenticate(self):
-        """
-        Full 3-step OAuth flow. COSTS 1 LICENSE.
-        Only called when JSESSIONID is dead or missing.
-        """
         if not self._running:
             return False
 
-        # License warning
         if self._full_auth_count >= 25:
             self._log("WARNING: Approaching license limit (%d/30 used)!" % self._full_auth_count)
 
@@ -508,7 +484,7 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab, IExtensionStateListener):
 
             auth_path = auth_path.replace("main.com", main_domain)
 
-            # === STEP 1: SSO Authorize ===
+            # === STEP 1 ===
             if not self._running:
                 return False
 
@@ -549,12 +525,12 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab, IExtensionStateListener):
 
             self._log("Step 1 OK: code=%s..." % code[:20])
 
-            # === STEP 2: Callback (creates JSESSIONID = consumes license) ===
+            # === STEP 2 ===
             if not self._running:
                 return False
 
             callback_url = location
-            self._log("Step 2/3: GET %s [THIS CREATES NEW JSESSIONID = 1 LICENSE]" % callback_url[:60])
+            self._log("Step 2/3: GET %s [CREATES JSESSIONID = 1 LICENSE]" % callback_url[:60])
 
             response2 = self._make_request(callback_url, {
                 "Referer": "https://%s/" % sso_domain,
@@ -571,7 +547,6 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab, IExtensionStateListener):
                 self._log("FAIL Step 2: Expected 200, got %d" % status2)
                 return False
 
-            # Extract JSESSIONID
             jsessionid = None
             for cookie in resp2_info.getCookies():
                 name = cookie.getName()
@@ -598,7 +573,7 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab, IExtensionStateListener):
 
             self._log("Step 2 OK: JSESSIONID=%s... [LICENSE CONSUMED]" % jsessionid[:20])
 
-            # === STEP 3: Token Request ===
+            # === STEP 3 ===
             if not self._running:
                 return False
 
@@ -636,7 +611,7 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab, IExtensionStateListener):
                 self._log("FAIL Step 3: No 'token' in JSON")
                 return False
 
-            # === CACHE EVERYTHING ===
+            # === CACHE ===
             self._jwt_token = jwt
             self._jsessionid = jsessionid
             self._jwt_expiry = self._parse_jwt_expiry(jwt)
@@ -677,14 +652,10 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab, IExtensionStateListener):
                 port = 443 if use_https else 80
 
             request = self._helpers.buildHttpRequest(url)
-            request = self._helpers.addHeader(request,
-                "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36")
+            request = self._helpers.addHeader(request, "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36")
             request = self._helpers.addHeader(request, "Accept: */*")
             request = self._helpers.addHeader(request, "Accept-Language: en-US")
-            request = self._helpers.addHeader(request, "sec-ch-ua: \"Not;A=Brand\";v=\"24\", \"Chromium\";v=\"128\"")
-            request = self._helpers.addHeader(request, "sec-ch-ua-mobile: ?0")
-            request = self._helpers.addHeader(request, "sec-ch-ua-platform: \"Windows\"")
-
+            
             if extra_headers:
                 for k, v in extra_headers.items():
                     request = self._helpers.addHeader(request, "%s: %s" % (k, v))
@@ -716,8 +687,7 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab, IExtensionStateListener):
     def _add_auth(self, request_bytes):
         try:
             request_bytes = self._helpers.removeHeader(request_bytes, "Authorization")
-            request_bytes = self._helpers.addHeader(request_bytes,
-                "Authorization: Bearer %s" % self._jwt_token)
+            request_bytes = self._helpers.addHeader(request_bytes, "Authorization: Bearer %s" % self._jwt_token)
 
             request_info = self._helpers.analyzeRequest(request_bytes)
             cookie_header_value = None
@@ -819,7 +789,6 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab, IExtensionStateListener):
         self._log("Extension STOPPED")
 
     def _refresh_jwt_clicked(self, event):
-        """Manual JWT-only refresh (FREE - no license)"""
         self._log("Manual JWT-only refresh requested (free)")
         with self._auth_lock:
             self._jwt_token = None
@@ -827,7 +796,6 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab, IExtensionStateListener):
         threading.Thread(target=self._ensure_token).start()
 
     def _refresh_full_clicked(self, event):
-        """Manual full auth (costs 1 license)"""
         confirm = JOptionPane.showConfirmDialog(
             self._main_panel,
             "This will consume 1 license (current: %d/30).\nAre you sure?" % self._full_auth_count,
@@ -850,7 +818,7 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab, IExtensionStateListener):
             self._jwt_expiry = 0
             self._jsessionid_alive = False
         self._update_status_ui()
-        self._log("Token cache cleared (license counter NOT reset)")
+        self._log("Token cache cleared")
 
     def _save_clicked(self, event):
         self._save_settings()
@@ -887,11 +855,10 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab, IExtensionStateListener):
                 if self._jwt_token and self._jwt_expiry > 0:
                     time_remaining = self._jwt_expiry - time.time()
                     if time_remaining < 120:
-                        self._log("Proactive refresh: JWT expires in %ds (will try free refresh first)" % int(time_remaining))
+                        self._log("Proactive refresh: JWT expires in %ds" % int(time_remaining))
                         with self._auth_lock:
                             self._jwt_token = None
                             self._jwt_expiry = 0
-                        # This will try JWT-only first, then full if needed
                         self._ensure_token()
 
             except Exception as e:
@@ -952,7 +919,6 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab, IExtensionStateListener):
 
     def _update_status_ui(self):
         def update():
-            # License counter (RED when near limit)
             self._license_label.setText("%d / 30" % self._full_auth_count)
             if self._full_auth_count >= 25:
                 self._license_label.setForeground(Color.RED)
