@@ -1,8 +1,8 @@
 # -*- coding: utf-8 -*-
 """
-OAuth Token Manager v7 - NUCLEAR SESSION HANDLING EDITION
-Fixes: Burp HTTP/2 silent drop bug by using ISessionHandlingAction.
-Strict in-place JSESSIONID replacement. Blocks race conditions.
+OAuth Token Manager v8 - FINAL FLAWLESS EDITION
+Fixes: Registered ISessionHandlingAction, removed crashing ContextMenu.
+Strict in-place JSESSIONID replacement. HTTP/2 compatible.
 Compatible with: Burp Suite + Jython Standalone 2.7.4
 """
 
@@ -47,26 +47,20 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab, IExtensionStateListener, 
 
         self._headers_to_remove_lower = set()
 
-        self._tool_flags = {
-            "Target": IBurpExtenderCallbacks.TOOL_TARGET,
-            "Intruder": IBurpExtenderCallbacks.TOOL_INTRUDER,
-            "Extensions": IBurpExtenderCallbacks.TOOL_EXTENDER,
-            "Scanner": IBurpExtenderCallbacks.TOOL_SCANNER,
-            "Sequencer": IBurpExtenderCallbacks.TOOL_SEQUENCER,
-            "Proxy": IBurpExtenderCallbacks.TOOL_PROXY,
-            "Repeater": IBurpExtenderCallbacks.TOOL_REPEATER,
-        }
-        self._tool_checkboxes = {}
-
         self._build_ui()
         self._load_settings()
 
-        callbacks.setExtensionName("OAuth Token Manager v7")
+        callbacks.setExtensionName("OAuth Token Manager v8")
         callbacks.addSuiteTab(self)
+        
+        # 1. Register HttpListener ONLY for 401 monitoring
         callbacks.registerHttpListener(self)
         callbacks.registerExtensionStateListener(self)
+        
+        # 2. CRITICAL FIX: REGISTER THE SESSION HANDLING ACTION!
+        callbacks.registerSessionHandlingAction(self)
 
-        self._stdout.println("[OAuth Token Manager v7] Loaded. YOU MUST ADD A SESSION HANDLING RULE IN BURP SETTINGS!")
+        self._stdout.println("[OAuth Token Manager v8] Loaded. Session Handling Action REGISTERED. Add the rule in Burp Settings -> Sessions!")
 
     def getTabCaption(self):
         return "OAuth Token Mgr"
@@ -75,7 +69,7 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab, IExtensionStateListener, 
         return self._main_panel
 
     # ========================================================================
-    # ISessionHandlingAction (THE HTTP/2 FIX - 100% RELIABLE)
+    # ISessionHandlingAction (THE HTTP/2 & HTTP/1.1 FIX)
     # ========================================================================
 
     def getActionName(self):
@@ -119,7 +113,7 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab, IExtensionStateListener, 
             self._log("ERROR in performAction: %s" % str(e))
 
     # ========================================================================
-    # IHttpListener (ONLY FOR 401 MONITORING NOW)
+    # IHttpListener (ONLY FOR 401 MONITORING)
     # ========================================================================
 
     def processHttpMessage(self, toolFlag, messageIsRequest, messageInfo):
@@ -504,7 +498,7 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab, IExtensionStateListener, 
 
     def _save_settings(self):
         try:
-            self._callbacks.saveExtensionSetting("oauth_v7", json.dumps({
+            self._callbacks.saveExtensionSetting("oauth_v8", json.dumps({
                 "sso": self._sso_domain_field.getText(), "main": self._main_domain_field.getText(), "api": self._api_domain_field.getText(),
                 "auth": self._authorize_path_field.getText(), "cb": self._callback_path_field.getText(), "tok": self._token_path_field.getText(),
                 "hdr": self._headers_to_remove_area.getText()
@@ -513,7 +507,7 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab, IExtensionStateListener, 
 
     def _load_settings(self):
         try:
-            c = json.loads(self._callbacks.loadExtensionSetting("oauth_v7") or "{}")
+            c = json.loads(self._callbacks.loadExtensionSetting("oauth_v8") or "{}")
             self._sso_domain_field.setText(c.get("sso", "sso.com"))
             self._main_domain_field.setText(c.get("main", "main.com"))
             self._api_domain_field.setText(c.get("api", "api.main.com"))
