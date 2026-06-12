@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """
-OAuth Token Manager v2 - License-Safe Edition
-Prevents license exhaustion by separating JWT refresh from full auth flow.
+OAuth Token Manager v3 - BULLETPROOF EDITION
+Fixed: IHttpListener signature, Jython addHeader bug, Request modification logic.
 Compatible with: Burp Suite + Jython Standalone 2.7.4
 """
 
@@ -33,7 +33,6 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab, IExtensionStateListener):
         self._stdout = PrintWriter(callbacks.getStdout(), True)
         self._stderr = PrintWriter(callbacks.getStderr(), True)
 
-        # === STATE ===
         self._running = False
         self._jwt_token = None
         self._jsessionid = None
@@ -61,16 +60,12 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab, IExtensionStateListener):
         self._build_ui()
         self._load_settings()
 
-        callbacks.setExtensionName("OAuth Token Manager v2")
+        callbacks.setExtensionName("OAuth Token Manager v3")
         callbacks.addSuiteTab(self)
         callbacks.registerHttpListener(self)
         callbacks.registerExtensionStateListener(self)
 
-        self._stdout.println("[OAuth Token Manager v2] License-safe extension loaded successfully")
-
-    # ========================================================================
-    # ITab
-    # ========================================================================
+        self._stdout.println("[OAuth Token Manager v3] BULLETPROOF extension loaded")
 
     def getTabCaption(self):
         return "OAuth Token Mgr"
@@ -78,15 +73,10 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab, IExtensionStateListener):
     def getUiComponent(self):
         return self._main_panel
 
-    # ========================================================================
-    # UI
-    # ========================================================================
-
     def _build_ui(self):
         self._main_panel = JPanel(BorderLayout(5, 5))
         self._main_panel.setBorder(BorderFactory.createEmptyBorder(10, 10, 10, 10))
 
-        # ---- TOP: Controls ----
         top_panel = JPanel(FlowLayout(FlowLayout.LEFT, 5, 5))
         top_panel.setBorder(BorderFactory.createTitledBorder("Controls"))
 
@@ -111,11 +101,9 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab, IExtensionStateListener):
 
         self._main_panel.add(top_panel, BorderLayout.NORTH)
 
-        # ---- CENTER ----
         center_panel = JPanel()
         center_panel.setLayout(BoxLayout(center_panel, BoxLayout.Y_AXIS))
 
-        # -- Domains --
         domain_panel = JPanel(GridBagLayout())
         domain_panel.setBorder(BorderFactory.createTitledBorder("Domain Configuration"))
         gbc = GridBagConstraints()
@@ -139,7 +127,6 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab, IExtensionStateListener):
         center_panel.add(domain_panel)
         center_panel.add(Box.createVerticalStrut(5))
 
-        # -- OAuth Paths --
         oauth_panel = JPanel(GridBagLayout())
         oauth_panel.setBorder(BorderFactory.createTitledBorder("OAuth Path Configuration"))
         gbc = GridBagConstraints()
@@ -170,7 +157,6 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab, IExtensionStateListener):
         center_panel.add(oauth_panel)
         center_panel.add(Box.createVerticalStrut(5))
 
-        # -- SSO Cookie --
         cookie_panel = JPanel(BorderLayout())
         cookie_panel.setBorder(BorderFactory.createTitledBorder("SSO Cookie (Paste daily)"))
         self._sso_cookie_area = JTextArea(4, 50)
@@ -180,7 +166,6 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab, IExtensionStateListener):
         center_panel.add(cookie_panel)
         center_panel.add(Box.createVerticalStrut(5))
 
-        # -- Headers to Remove --
         headers_panel = JPanel(BorderLayout())
         headers_panel.setBorder(BorderFactory.createTitledBorder("Headers to Remove (one per line)"))
         self._headers_to_remove_area = JTextArea(3, 50)
@@ -189,7 +174,6 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab, IExtensionStateListener):
         center_panel.add(headers_panel)
         center_panel.add(Box.createVerticalStrut(5))
 
-        # -- Tool Scope --
         tool_panel = JPanel(FlowLayout(FlowLayout.LEFT, 10, 5))
         tool_panel.setBorder(BorderFactory.createTitledBorder("Tool Scope"))
         for tool_name in ["Target", "Proxy", "Repeater", "Intruder", "Scanner", "Sequencer", "Extensions"]:
@@ -199,7 +183,6 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab, IExtensionStateListener):
         center_panel.add(tool_panel)
         center_panel.add(Box.createVerticalStrut(5))
 
-        # -- License & Token Status --
         status_panel = JPanel(GridBagLayout())
         status_panel.setBorder(BorderFactory.createTitledBorder("License & Token Status"))
         gbc = GridBagConstraints()
@@ -255,7 +238,6 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab, IExtensionStateListener):
         center_panel.add(status_panel)
         center_panel.add(Box.createVerticalStrut(5))
 
-        # -- Log --
         log_panel = JPanel(BorderLayout())
         log_panel.setBorder(BorderFactory.createTitledBorder("Log"))
         self._log_area = JTextArea(10, 50)
@@ -273,64 +255,62 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab, IExtensionStateListener):
         self._main_panel.add(scroll_pane, BorderLayout.CENTER)
 
     # ========================================================================
-    # IHttpListener
+    # IHttpListener (FIXED SIGNATURE - THIS WAS THE FATAL BUG)
     # ========================================================================
 
-    def processHttpMessage(self, message_info):
+    def processHttpMessage(self, toolFlag, messageIsRequest, messageInfo):
         if not self._running:
             return
 
         if getattr(self._auth_local, 'in_progress', False):
             return
 
-        request = message_info.getRequest()
-        if request is None:
+        if not self._is_tool_enabled(toolFlag):
             return
 
-        tool_flag = message_info.getToolFlag()
-        if not self._is_tool_enabled(tool_flag):
-            return
-
-        response = message_info.getResponse()
-
-        if response is None:
-            self._process_request(message_info)
+        if messageIsRequest:
+            self._process_request(messageInfo)
         else:
-            self._process_response(message_info)
+            self._process_response(messageInfo)
 
-    def _process_request(self, message_info):
+    def _process_request(self, messageInfo):
         try:
-            request = message_info.getRequest()
-            http_service = message_info.getHttpService()
+            request = messageInfo.getRequest()
+            http_service = messageInfo.getHttpService()
             request_info = self._helpers.analyzeRequest(http_service, request)
             url = request_info.getUrl()
             host = url.getHost()
+            path = url.getPath()
 
-            request = self._strip_headers(request)
-
+            strip_list = list(self._headers_to_remove_lower)
+            add_auth_headers = {}
+            replace_cookies = {}
+            
             main_domain = self._main_domain_field.getText().strip().lower()
             if main_domain and main_domain in host.lower():
-                path = url.getPath()
                 token_path = self._token_path_field.getText().strip()
                 callback_path = self._callback_path_field.getText().strip()
-
+                
                 is_auth_flow = (token_path and path.startswith(token_path)) or \
                                (callback_path and path.startswith(callback_path))
-
+                               
                 if not is_auth_flow:
-                    if not self._ensure_token():
-                        self._log("WARN: Cannot add auth for: %s" % path)
+                    if self._ensure_token():
+                        add_auth_headers["Authorization"] = "Bearer %s" % self._jwt_token
+                        replace_cookies["JSESSIONID"] = self._jsessionid
                     else:
-                        request = self._add_auth(request)
+                        self._log("WARN: Cannot add auth for: %s" % path)
 
-            message_info.setRequest(request)
+            if strip_list or add_auth_headers or replace_cookies:
+                new_request = self._modify_request(request, strip_list, add_auth_headers, replace_cookies)
+                messageInfo.setRequest(new_request)
 
         except Exception as e:
             self._log("ERROR in _process_request: %s" % str(e))
 
-    def _process_response(self, message_info):
+    def _process_response(self, messageInfo):
         try:
-            response = message_info.getResponse()
+            response = messageInfo.getResponse()
             if response is None:
                 return
 
@@ -339,7 +319,7 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab, IExtensionStateListener):
 
             if status_code == 401:
                 request_info = self._helpers.analyzeRequest(
-                    message_info.getHttpService(), message_info.getRequest())
+                    messageInfo.getHttpService(), messageInfo.getRequest())
                 url = request_info.getUrl()
                 main_domain = self._main_domain_field.getText().strip().lower()
 
@@ -352,6 +332,54 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab, IExtensionStateListener):
 
         except Exception as e:
             self._log("ERROR in _process_response: %s" % str(e))
+
+    # ========================================================================
+    # BULLETPROOF REQUEST MODIFICATION (NO MORE addHeader/removeHeader)
+    # ========================================================================
+
+    def _modify_request(self, request_bytes, strip_headers_lower=None, add_headers=None, replace_cookies=None):
+        try:
+            req_info = self._helpers.analyzeRequest(request_bytes)
+            headers = list(req_info.getHeaders())
+            body = request_bytes[req_info.getBodyOffset():]
+            
+            if strip_headers_lower:
+                headers = [h for h in headers if not (":" in h and h.split(":")[0].strip().lower() in strip_headers_lower)]
+                
+            if add_headers:
+                for name, value in add_headers.items():
+                    headers = [h for h in headers if not (":" in h and h.split(":")[0].strip().lower() == name.lower())]
+                    headers.append("%s: %s" % (name, value))
+                    
+            if replace_cookies:
+                cookie_idx = -1
+                cookie_header_val = None
+                for i, h in enumerate(headers):
+                    if h.lower().startswith("cookie:"):
+                        cookie_header_val = h.split(":", 1)[1].strip()
+                        cookie_idx = i
+                        break
+                        
+                cookies = {}
+                if cookie_header_val:
+                    for part in cookie_header_val.split(";"):
+                        if "=" in part:
+                            k, v = part.split("=", 1)
+                            cookies[k.strip()] = v.strip()
+                            
+                cookies.update(replace_cookies)
+                new_cookie_str = "; ".join(["%s=%s" % (k, v) for k, v in cookies.items()])
+                
+                if cookie_idx != -1:
+                    headers[cookie_idx] = "Cookie: %s" % new_cookie_str
+                else:
+                    headers.append("Cookie: %s" % new_cookie_str)
+                    
+            return self._helpers.buildHttpMessage(headers, body)
+            
+        except Exception as e:
+            self._log("ERROR in _modify_request: %s" % str(e))
+            return request_bytes
 
     # ========================================================================
     # LICENSE-SAFE TOKEN MANAGEMENT
@@ -484,13 +512,9 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab, IExtensionStateListener):
 
             auth_path = auth_path.replace("main.com", main_domain)
 
-            # === STEP 1 ===
-            if not self._running:
-                return False
-
+            if not self._running: return False
             auth_url = "https://%s%s" % (sso_domain, auth_path)
             self._log("Step 1/3: GET %s" % auth_url[:80])
-
             response1 = self._make_request(auth_url, {"Cookie": sso_cookie})
 
             if response1 is None or response1.getResponse() is None:
@@ -525,16 +549,10 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab, IExtensionStateListener):
 
             self._log("Step 1 OK: code=%s..." % code[:20])
 
-            # === STEP 2 ===
-            if not self._running:
-                return False
-
+            if not self._running: return False
             callback_url = location
             self._log("Step 2/3: GET %s [CREATES JSESSIONID = 1 LICENSE]" % callback_url[:60])
-
-            response2 = self._make_request(callback_url, {
-                "Referer": "https://%s/" % sso_domain,
-            })
+            response2 = self._make_request(callback_url, {"Referer": "https://%s/" % sso_domain})
 
             if response2 is None or response2.getResponse() is None:
                 self._log("FAIL Step 2: No response")
@@ -573,13 +591,9 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab, IExtensionStateListener):
 
             self._log("Step 2 OK: JSESSIONID=%s... [LICENSE CONSUMED]" % jsessionid[:20])
 
-            # === STEP 3 ===
-            if not self._running:
-                return False
-
+            if not self._running: return False
             token_url = "https://%s%s" % (main_domain, token_path)
             self._log("Step 3/3: GET %s" % token_url[:80])
-
             response3 = self._make_request(token_url, {
                 "Cookie": "JSESSIONID=%s" % jsessionid,
                 "Accept": "application/json, text/plain, */*",
@@ -611,7 +625,6 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab, IExtensionStateListener):
                 self._log("FAIL Step 3: No 'token' in JSON")
                 return False
 
-            # === CACHE ===
             self._jwt_token = jwt
             self._jsessionid = jsessionid
             self._jwt_expiry = self._parse_jwt_expiry(jwt)
@@ -638,7 +651,7 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab, IExtensionStateListener):
             self._auth_local.in_progress = False
 
     # ========================================================================
-    # HTTP Helpers
+    # BULLETPROOF HTTP HELPER (NO MORE addHeader)
     # ========================================================================
 
     def _make_request(self, url_str, extra_headers=None):
@@ -651,70 +664,33 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab, IExtensionStateListener):
             if port == -1:
                 port = 443 if use_https else 80
 
-            request = self._helpers.buildHttpRequest(url)
-            request = self._helpers.addHeader(request, "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36")
-            request = self._helpers.addHeader(request, "Accept: */*")
-            request = self._helpers.addHeader(request, "Accept-Language: en-US")
+            path = url.getPath()
+            if not path:
+                path = "/"
+            query = url.getQuery()
+            if query:
+                path += "?" + query
+                
+            headers = [
+                "GET %s HTTP/1.1" % path,
+                "Host: %s" % host,
+                "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36",
+                "Accept: */*",
+                "Accept-Language: en-US",
+                "Connection: close"
+            ]
             
             if extra_headers:
                 for k, v in extra_headers.items():
-                    request = self._helpers.addHeader(request, "%s: %s" % (k, v))
-
+                    headers.append("%s: %s" % (k, v))
+                    
+            request = self._helpers.buildHttpMessage(headers, None)
             http_service = self._helpers.buildHttpService(host, port, use_https)
             return self._callbacks.makeHttpRequest(http_service, request)
 
         except Exception as e:
             self._log("ERROR _make_request %s: %s" % (url_str[:50], str(e)))
             return None
-
-    def _strip_headers(self, request_bytes):
-        if not self._headers_to_remove_lower:
-            return request_bytes
-        try:
-            request_info = self._helpers.analyzeRequest(request_bytes)
-            to_remove = []
-            for header in request_info.getHeaders():
-                if ":" in header:
-                    name = header.split(":")[0].strip()
-                    if name.lower() in self._headers_to_remove_lower:
-                        to_remove.append(name)
-            for name in to_remove:
-                request_bytes = self._helpers.removeHeader(request_bytes, name)
-        except Exception as e:
-            self._log("ERROR stripping headers: %s" % str(e))
-        return request_bytes
-
-    def _add_auth(self, request_bytes):
-        try:
-            request_bytes = self._helpers.removeHeader(request_bytes, "Authorization")
-            request_bytes = self._helpers.addHeader(request_bytes, "Authorization: Bearer %s" % self._jwt_token)
-
-            request_info = self._helpers.analyzeRequest(request_bytes)
-            cookie_header_value = None
-            for header in request_info.getHeaders():
-                if header.lower().startswith("cookie:"):
-                    cookie_header_value = header.split(":", 1)[1].strip()
-                    break
-
-            cookies_ordered = []
-            if cookie_header_value:
-                for cookie_part in cookie_header_value.split(";"):
-                    cookie_part = cookie_part.strip()
-                    if "=" in cookie_part:
-                        name = cookie_part.split("=", 1)[0].strip()
-                        value = cookie_part.split("=", 1)[1].strip()
-                        if name.upper() != "JSESSIONID":
-                            cookies_ordered.append((name, value))
-
-            cookies_ordered.append(("JSESSIONID", self._jsessionid))
-            cookie_str = "; ".join(["%s=%s" % (n, v) for n, v in cookies_ordered])
-
-            request_bytes = self._helpers.removeHeader(request_bytes, "Cookie")
-            request_bytes = self._helpers.addHeader(request_bytes, "Cookie: %s" % cookie_str)
-
-        except Exception as e:
-            self._log("ERROR adding auth: %s" % str(e))
-        return request_bytes
 
     # ========================================================================
     # Utilities
@@ -841,10 +817,6 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab, IExtensionStateListener):
             self._log_area.setText("")
         SwingUtilities.invokeLater(update)
 
-    # ========================================================================
-    # Background Refresh
-    # ========================================================================
-
     def _refresh_loop(self):
         while self._running:
             try:
@@ -865,10 +837,6 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab, IExtensionStateListener):
                 if self._running:
                     self._log("Refresh loop error: %s" % str(e))
 
-    # ========================================================================
-    # Settings
-    # ========================================================================
-
     def _save_settings(self):
         try:
             settings = {
@@ -882,13 +850,13 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab, IExtensionStateListener):
             }
             for name, cb in self._tool_checkboxes.items():
                 settings["tools"][name] = cb.isSelected()
-            self._callbacks.saveExtensionSetting("oauth_config_v2", json.dumps(settings))
+            self._callbacks.saveExtensionSetting("oauth_config_v3", json.dumps(settings))
         except Exception as e:
             self._log("Save failed: %s" % str(e))
 
     def _load_settings(self):
         try:
-            config_str = self._callbacks.loadExtensionSetting("oauth_config_v2")
+            config_str = self._callbacks.loadExtensionSetting("oauth_config_v3")
             if config_str:
                 config = json.loads(config_str)
                 self._sso_domain_field.setText(config.get("sso_domain", "sso.com"))
@@ -900,13 +868,9 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab, IExtensionStateListener):
                 tools = config.get("tools", {})
                 for name, cb in self._tool_checkboxes.items():
                     cb.setSelected(tools.get(name, True))
-                self._stdout.println("[OAuth Token Manager v2] Settings loaded")
+                self._stdout.println("[OAuth Token Manager v3] Settings loaded")
         except Exception as e:
-            self._stdout.println("[OAuth Token Manager v2] Load failed: %s" % str(e))
-
-    # ========================================================================
-    # UI Updates
-    # ========================================================================
+            self._stdout.println("[OAuth Token Manager v3] Load failed: %s" % str(e))
 
     def _update_headers_to_remove(self):
         text = self._headers_to_remove_area.getText().strip()
@@ -974,10 +938,6 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab, IExtensionStateListener):
                 self._auth_status_label.setForeground(Color(0, 0, 200))
         SwingUtilities.invokeLater(update)
 
-    # ========================================================================
-    # Logging
-    # ========================================================================
-
     def _log(self, message):
         timestamp = datetime.now().strftime("%H:%M:%S")
         log_msg = "[%s] %s" % (timestamp, message)
@@ -996,10 +956,6 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab, IExtensionStateListener):
         SwingUtilities.invokeLater(update)
         self._stdout.println(log_msg)
 
-    # ========================================================================
-    # Lifecycle
-    # ========================================================================
-
     def extensionUnloaded(self):
         self._running = False
-        self._stdout.println("[OAuth Token Manager v2] Unloaded")
+        self._stdout.println("[OAuth Token Manager v3] Unloaded")
