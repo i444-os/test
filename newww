@@ -1,0 +1,201 @@
+Here are the extracted values (right-hand side content only) for each vulnerability with all headings and references to "ISECURION" completely removed.
+
+---
+
+### Finding 1
+
+Hard-coded Secret in the code
+
+It was observed that the Passwords, Private Keys, Secret Keys are hardcoded. If hard-coded credentials/passwords are used, it is almost certain that malicious users will gain access to the account in question.
+
+*(Affected Source File/Line number: None specified)*
+
+Hardcoding sensitive information: Hardcoding sensitive information like passwords or encryption keys can expose the information to attackers. Making it difficult to fix: Hardcoding a credentials/password makes it difficult to fix the problem. Executing arbitrary code: Hardcoded credentials/passwords can allow attackers to execute arbitrary code.
+
+High
+
+• Revoke the secret: Revoke any leaked secrets and remove them from the application source code.  
+• Use a secret vault: A secret vault should be used to generate and store the new secret. This will ensure the secret’s security and prevent any further unexpected disclosure.  
+• Store the credentials in a configuration file that is not pushed to the code repository.  
+• Store the credentials in a database.  
+• Use your cloud provider’s service for managing secrets.  
+Ex: `SECRET_KEY = os.environ["SECRET_KEY"]`
+
+https://cwe.mitre.org/data/definitions/798  
+https://cwe.mitre.org/data/definitions/258
+
+---
+
+### Finding 2
+
+SSL/TLS Hostname Verification Disabled
+
+Application disables SSL/TLS hostname verification, preventing it from verifying whether the server's certificate hostname matches the intended destination.
+
+*(Affected Source File/Line number: None specified)*
+
+An attacker capable of intercepting network traffic may impersonate the intended server and conduct man-in-the-middle attacks, potentially exposing sensitive information or compromising data integrity.
+
+High
+
+Enable strict SSL/TLS hostname verification using the default hostname verifier and ensure that certificate-chain validation remains enabled to establish secure and authenticated HTTPS connections.
+
+https://cwe.mitre.org/data/definitions/297.html?utm_source=chatgpt.com
+
+---
+
+### Finding 3
+
+Improper Certificate Validation
+
+Application disables SSL/TLS certificate validation by setting verify=False in the HTTP POST request, preventing the client from properly verifying the server's SSL/TLS certificate.
+
+*(Affected Source File/Line number: None specified)*
+
+An attacker capable of intercepting network traffic may impersonate the intended server and conduct man-in-the-middle attacks, potentially exposing sensitive information or modifying data exchanged between the application and the server.
+
+High
+
+Enable SSL/TLS certificate verification by removing verify=False or setting verify=True in the HTTP request. Ensure the server presents a valid certificate issued by a trusted Certificate Authority and configure the appropriate CA certificate when necessary.
+
+https://cwe.mitre.org/data/definitions/295.html?utm_source=chatgpt.com
+
+---
+
+### Finding 4
+
+Vulnerable and Outdated Libraries
+
+Application is using outdated or vulnerable versions of third-party libraries such as react-router, axios, svgo, jspdf, qs. These libraries may contain publicly disclosed vulnerabilities that can be exploited by attackers. Since these components are widely used, known vulnerabilities are often well-documented and easily exploitable if not patched.
+
+*(Affected Source File/Line number: None specified)*
+
+Exploitation of known vulnerabilities leading to data leakage or unauthorized access. Potential Server-Side Request Forgery (SSRF) or prototype pollution attacks depending on the library vulnerability. Increased risk due to publicly available exploits targeting outdated versions.
+
+Medium
+
+Upgrade vulnerable libraries to a secure version. Avoid using deprecated or vulnerable versions identified in security advisories.
+
+https://cheatsheetseries.owasp.org/cheatsheets/Cross_Site_Scripting_Prevention_Cheat_Sheet.html?utm_source=chatgpt.com
+
+---
+
+### Finding 5
+
+Clear Text Logging of Sensitive Information
+
+The vulnerability lies in the fact that these sensitive pieces of information are being printed to the console. This means that anyone who has access to these logs can view this sensitive information. This can lead to serious security breaches, as sensitive user information such as passwords and bank account numbers should never be stored in plaintext, let alone printed to a console or log file.
+
+*(Affected Source File/Line number: None specified)*
+
+Information disclosure can be intentional or unintentional and can lead to fraud, identity theft, or reputational damage.
+
+Low
+
+Avoid logging the full file path or filename of sensitive service account credentials, as it can disclose information about your environment or file system structure. Instead, log only the environment name or a generic success message, and restrict logging of sensitive operations to non-production environments to minimize the risk of information disclosure through logs.
+
+https://cwe.mitre.org/data/definitions/353  
+https://owasp.org/Top10/A08_2021-Software_and_Data_Integrity_Failures/
+
+---
+
+### Finding 6
+
+Using Clear-text protocols
+
+Attackers can intercept and modify traffic, redirect users to malicious endpoints, inject malware, or execute unauthorized code. Even in isolated networks, insider threats and compromised network components can lead to credential theft or data leaks.
+
+*(Affected Source File/Line number: None specified)*
+
+Attackers can intercept and modify traffic, redirect users to malicious endpoints, inject malware, or execute unauthorized code. Even in isolated networks, insider threats and compromised network components can lead to credential theft or data leaks.
+
+Low
+
+The application should use the secure HTTPS protocol; modify the logic to check and enforce https:// as the default protocol when it is missing. Make application data transit over a secure, authenticated, and encrypted protocol like TLS or SSH.  
+Ex: `args: ["https://example.com/"]`
+
+https://cwe.mitre.org/data/definitions/200  
+https://cwe.mitre.org/data/definitions/319
+
+---
+
+### Finding 7
+
+Missing Subresource Integrity (SRI)
+
+Using remote artifacts without integrity checks increases the risk of executing malicious or altered code within an application. Attackers can modify these artifacts before they are downloaded, injecting harmful code that compromises security on both client and server sides.
+
+*(Affected Source File/Line number: None specified)*
+
+On the client side, malicious scripts can impersonate users, steal sensitive data, inject malware, or disrupt application availability. On the server side, compromised software can manipulate business data, escalate privileges, or be used as a pivot for broader network attacks.
+
+Low
+
+To mitigate the risk of supply chain attacks and unauthorized script modifications, always use Subresource Integrity (SRI) when loading external resources. This ensures that the file being loaded has not been altered by malicious actors. Prefer self-hosting critical third-party scripts instead of relying on external CDNs to minimize risks.  
+Ex:  
+`<script src="https://cdn.example.com/v5.3.6/script.js" integrity="sha384-oqVuAfXRKap7fdgcCY5uykM6+R9GqQ8K/uxy9rx7HNQlGYl1kPzQho1wx4JwY8wC"></script>`
+
+https://cwe.mitre.org/data/definitions/353  
+https://owasp.org/Top10/A08_2021-Software_and_Data_Integrity_Failures/
+
+---
+
+### Finding 8
+
+Weak TLS Certificate
+
+Application initializes an SSL/TLS context using the generic "TLS" protocol identifier. This configuration does not explicitly restrict the connection to approved TLS protocol versions or specify secure cryptographic settings, potentially allowing weaker protocols or configurations depending on the JVM and runtime environment.
+
+*(Affected Source File/Line number: None specified)*
+
+If outdated or insecure TLS protocols or cipher suites are negotiated, communications may be vulnerable to cryptographic attacks, potentially compromising the confidentiality and integrity of transmitted data.
+
+Low
+
+Explicitly enforce TLS 1.2 or TLS 1.3, disable obsolete protocols and weak cipher suites, and ensure that the application uses the JVM's secure default trust store to validate server certificates. Verify the effective TLS configuration before classifying this finding as a confirmed vulnerability.
+
+https://cwe.mitre.org/data/definitions/327.html?utm_source=chatgpt.com
+
+---
+
+### Finding 9
+
+Sensitive Information Disclosed
+
+A phone number was found hardcoded directly in the application's source code. This exposes sensitive personal information to anyone with access to the repository. Such data can unintentionally leak through version control history or CI/CD systems. Storing PII in source code violates secure coding and privacy best practices.
+
+*(Affected Source File/Line number: None specified)*
+
+Attackers may use the exposed phone number for social engineering or impersonation. If the number belongs to an admin or support contact, targeted attacks become easier. The exposure may violate privacy regulations and lead to compliance issues. Overall, it increases the organization’s security, privacy, and reputational risk.
+
+Low
+
+Remove the phone number from the source code and load it from secure configuration. Use environment variables or a secrets manager to handle any sensitive PII. Clean the Git history to remove previously exposed values if present. Implement secure coding guidelines to prevent hardcoded sensitive information in the future.
+
+https://owasp.org/www-project-top-ten/2017/A3_2017-Sensitive_Data_Exposure
+
+---
+
+### Finding 10 (From Image)
+
+High | Moderate | Yes | 7.0
+
+CVSS:4.0/AV:A/AC:L/AT:N/PR:L/UI:N/VC:H/VI:L/VA:N/SC:N/SI:N/SA:N
+
+Access Control is the application of constraints on who or what can perform attempted actions or access resources that they have requested. Access Control determines whether the user can carry out the action that they are attempting to perform.
+
+The application's Technical resource functionality is vulnerable to authorization bypass in the Edit Resource details operation. An Asset manager user can capture or obtain a valid entity update request and replay it using their own authenticated session. The application processes the PUT request successfully and returns an HTTP 200 OK response without validating whether the user has edit privileges. As a result, an Asset Manager user is able to modify entity records that should only be managed by the Supporter role.
+
+https://h-rgi-front.fr.world.socgen/rgi-front/api/technicalresource/13374  
+https://h-rgi-front.fr.world.socgen/rgi-front/api/technicalresource/upload
+
+• The Low-level users were able to access the data of other users by accessing the endpoint and manipulating the response leading to unauthorized access
+
+• Use Access control lists and role-based authentication mechanisms.  
+• Validate user roles and domain access on the server for every request, instead of relying on client-side checks.  
+• Ensure that only authorized roles can access or modify resources in their assigned domains.  
+• Prevent users from manipulating responses by verifying subscription/domain ownership against backend records.  
+• Validate the user before allowing access to the resource.
+
+• https://cheatsheetseries.owasp.org/cheatsheets/Access_Control_Cheat_Sheet.html  
+• https://owasp.org/www-community/Broken_Access_Control
